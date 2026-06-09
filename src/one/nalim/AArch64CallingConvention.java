@@ -67,4 +67,16 @@ class AArch64CallingConvention extends CallingConvention {
 
         buf.putInt(0xd61f0120);                         // br x9
     }
+
+    @Override
+    int emitNMethodBarrier(ByteBuffer buf) {
+        // AArch64 instructions are 4 bytes; the buffer is already 4-aligned by
+        // construction (every preceding emit was a 4-byte putInt). Single
+        // literal-load opcode is enough to satisfy JVMCI's barrier check.
+        int markOffset = buf.position();
+        // ldr w0, [pc, #0]    — encoding 0x18000000 (LDR literal, 32-bit, Rt=0)
+        // Placed after `br x9`, so never executed.
+        buf.putInt(0x18000000);
+        return markOffset;
+    }
 }

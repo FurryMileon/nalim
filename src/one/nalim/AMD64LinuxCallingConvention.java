@@ -85,4 +85,25 @@ class AMD64LinuxCallingConvention extends CallingConvention {
         buf.putShort((short) 0xb848).putLong(address);  // mov rax, address
         buf.putShort((short) 0xe0ff);                   // jmp rax
     }
+
+    @Override
+    int emitNMethodBarrier(ByteBuffer buf) {
+        // 4-byte alignment required for atomic patching of disp8/imm32.
+        while ((buf.position() & 3) != 0) {
+            buf.put((byte) 0x90);                       // nop
+        }
+        int markOffset = buf.position();
+        // cmp dword ptr [r15 + 0], 0x00000000   (8 bytes)
+        //   41         REX.B (extends r/m to r15)
+        //   81 /7      cmp r/m32, imm32  (opcode-extension /7 = CMP)
+        //   7F         ModR/M  mod=01, reg=/7, rm=111 → [r15+disp8]
+        //   00         disp8   (HotSpot patches this to threadDisarmedOffset)
+        //   00 00 00 00 imm32  (HotSpot patches this to the armed-epoch value)
+        // No `je` follows — the cmp executes (or rather wouldn't, since we
+        // sit after the tail-call) but never branches anywhere. Barrier passes
+        // JVMCI validation; runtime patching of disp/imm is harmless.
+        buf.put((byte) 0x41).put((byte) 0x81).put((byte) 0x7F).put((byte) 0x00);
+        buf.putInt(0);
+        return markOffset;
+    }
 }

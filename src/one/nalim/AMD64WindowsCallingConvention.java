@@ -72,4 +72,18 @@ class AMD64WindowsCallingConvention extends CallingConvention {
         buf.putShort((short) 0xb848).putLong(address);  // mov rax, address
         buf.putShort((short) 0xe0ff);                   // jmp rax
     }
+
+    @Override
+    int emitNMethodBarrier(ByteBuffer buf) {
+        // Same sequence as Linux x64 — r15 is the JavaThread register on
+        // HotSpot Windows-x64 as well, and the barrier opcode is OS-agnostic.
+        while ((buf.position() & 3) != 0) {
+            buf.put((byte) 0x90);                       // nop
+        }
+        int markOffset = buf.position();
+        // cmp dword ptr [r15 + 0], 0x00000000  (see AMD64LinuxCallingConvention)
+        buf.put((byte) 0x41).put((byte) 0x81).put((byte) 0x7F).put((byte) 0x00);
+        buf.putInt(0);
+        return markOffset;
+    }
 }

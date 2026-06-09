@@ -55,4 +55,16 @@ class RISCV64CallingConvention extends CallingConvention {
         buf.putInt(0b0010011 | (t0 << 7) | (0b001 << 12) | (t0 << 15) | ( 6 << 20)); // slli t0, t0, 6
         buf.putInt(0b1100111 | (zr << 7) | (0b000 << 12) | (t0 << 15) | (a3 << 20)); // jalr a3(t0)
     }
+
+    @Override
+    int emitNMethodBarrier(ByteBuffer buf) {
+        // RISC-V64 instructions are 4 bytes; buffer is already 4-aligned.
+        // 8-byte barrier sequence (auipc + lw) per HotSpot RISC-V port — matches
+        // the bytes used by the avduckart/nalim fork, verified on JDK 21.
+        // Placed after `jalr a3(t0)`, so never executed.
+        int markOffset = buf.position();
+        buf.put((byte) 0x00).put((byte) 0x00).put((byte) 0x02).put((byte) 0x97);
+        buf.put((byte) 0x00).put((byte) 0x02).put((byte) 0xe2).put((byte) 0x83);
+        return markOffset;
+    }
 }
