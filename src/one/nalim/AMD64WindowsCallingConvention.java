@@ -61,8 +61,7 @@ class AMD64WindowsCallingConvention extends CallingConvention {
             } else if (type.isPrimitive()) {
                 emit(buf, (type == long.class ? MOVE_LONG_ARG : MOVE_INT_ARG)[index++]);
             } else {
-                emit(buf, MOVE_OBJ_ARG[index++]);
-                buf.put(asByte(baseOffset(type, annotations[i])));
+                emitLea(buf, MOVE_OBJ_ARG[index++], baseOffset(type, annotations[i]));
             }
         }
     }
@@ -71,6 +70,40 @@ class AMD64WindowsCallingConvention extends CallingConvention {
     public void emitCall(ByteBuffer buf, long address) {
         buf.putShort((short) 0xb848).putLong(address);  // mov rax, address
         buf.putShort((short) 0xe0ff);                   // jmp rax
+    }
+
+    @Override
+    void emitCallAndNormalize(
+            ByteBuffer buf, long address, Class<?> returnType, Class<?>[] parameterTypes) {
+        if (parameterTypes.length > 4) {
+            throw new IllegalArgumentException(
+                    "Narrow return with native stack arguments is not supported");
+        }
+
+        // 32-byte Win64 shadow space plus 8 bytes for call-site alignment.
+        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xEC).put((byte) 0x28);
+        buf.putShort((short) 0xb848).putLong(address);  // mov rax, address
+        buf.putShort((short) 0xd0ff);                   // call rax
+        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xC4).put((byte) 0x28);
+        emitAMD64ReturnNormalization(buf, returnType);
+        buf.put((byte) 0xC3);                          // ret
+    }
+
+    @Override
+    int emitDirectCallAndNormalize(
+            ByteBuffer buf, Class<?> returnType, Class<?>[] parameterTypes) {
+        if (parameterTypes.length > 4) {
+            throw new IllegalArgumentException(
+                    "Narrow return with native stack arguments is not supported");
+        }
+
+        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xEC).put((byte) 0x28);
+        int pcOffset = buf.position();
+        buf.put((byte) 0xE8).putInt(0);                 // call rel32 — JVMCI patches disp32
+        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xC4).put((byte) 0x28);
+        emitAMD64ReturnNormalization(buf, returnType);
+        buf.put((byte) 0xC3);                          // ret
+        return pcOffset;
     }
 
     @Override

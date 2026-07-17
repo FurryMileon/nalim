@@ -59,7 +59,13 @@ class AMD64LinuxCallingConvention extends CallingConvention {
 
     @Override
     public void javaToNative(ByteBuffer buf, Class<?>[] types, Annotation[][] annotations) {
-        if (types.length >= 6) {
+        int integerArgs = 0;
+        for (Class<?> type : types) {
+            if (!type.isPrimitive() || (type != float.class && type != double.class)) {
+                integerArgs++;
+            }
+        }
+        if (integerArgs >= 6) {
             // 6th Java argument clashes with the 1st native arg
             emit(buf, SAVE_LAST_ARG);
         }
@@ -72,8 +78,7 @@ class AMD64LinuxCallingConvention extends CallingConvention {
                     emit(buf, (type == long.class ? MOVE_LONG_ARG : MOVE_INT_ARG)[index++]);
                 }
             } else if (index < 6) {
-                emit(buf, MOVE_OBJ_ARG[index++]);
-                buf.put(asByte(baseOffset(type, annotations[i])));
+                emitLea(buf, MOVE_OBJ_ARG[index++], baseOffset(type, annotations[i]));
             } else {
                 throw new IllegalArgumentException("Too many object arguments");
             }
@@ -84,6 +89,51 @@ class AMD64LinuxCallingConvention extends CallingConvention {
     public void emitCall(ByteBuffer buf, long address) {
         buf.putShort((short) 0xb848).putLong(address);  // mov rax, address
         buf.putShort((short) 0xe0ff);                   // jmp rax
+    }
+
+    private static void checkRegisterOnlyArgs(Class<?>[] parameterTypes) {
+        int integerArgs = 0;
+        int floatingArgs = 0;
+        for (Class<?> type : parameterTypes) {
+            if (type == float.class || type == double.class) {
+                floatingArgs++;
+            } else {
+                integerArgs++;
+            }
+        }
+        if (integerArgs > 6 || floatingArgs > 8) {
+            throw new IllegalArgumentException(
+                    "Narrow return with native stack arguments is not supported");
+        }
+    }
+
+    @Override
+    void emitCallAndNormalize(
+            ByteBuffer buf, long address, Class<?> returnType, Class<?>[] parameterTypes) {
+        checkRegisterOnlyArgs(parameterTypes);
+
+        // The nmethod is entered with RSP%16 == 8. Reserve one slot so the
+        // nested System V call sees its required 16-byte-aligned call site.
+        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xEC).put((byte) 0x08);
+        buf.putShort((short) 0xb848).putLong(address);  // mov rax, address
+        buf.putShort((short) 0xd0ff);                   // call rax
+        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xC4).put((byte) 0x08);
+        emitAMD64ReturnNormalization(buf, returnType);
+        buf.put((byte) 0xC3);                          // ret
+    }
+
+    @Override
+    int emitDirectCallAndNormalize(
+            ByteBuffer buf, Class<?> returnType, Class<?>[] parameterTypes) {
+        checkRegisterOnlyArgs(parameterTypes);
+
+        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xEC).put((byte) 0x08);
+        int pcOffset = buf.position();
+        buf.put((byte) 0xE8).putInt(0);                 // call rel32 — JVMCI patches disp32
+        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xC4).put((byte) 0x08);
+        emitAMD64ReturnNormalization(buf, returnType);
+        buf.put((byte) 0xC3);                          // ret
+        return pcOffset;
     }
 
     @Override

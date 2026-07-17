@@ -3,3 +3,9 @@
 *.iml
 .gradle
 build
+/one/
+*.class
+*.so
+*.dylib
+*.dll
+**/target/
