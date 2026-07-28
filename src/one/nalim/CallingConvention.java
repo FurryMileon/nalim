@@ -55,6 +55,33 @@ abstract class CallingConvention {
     abstract void emitCall(ByteBuffer buf, long address);
 
     /**
+     * Whether a non-naked link must go through a real stack frame (callee-owned
+     * shadow space and/or native stack arguments) instead of a tail jump.
+     * When true, the Linker skips auto-inline and the tail-call paths and emits
+     * {@link #emitFramedCall} / {@link #emitDirectFramedCall} instead.
+     */
+    boolean requiresFramedCall(Class<?>[] parameterTypes) {
+        return false;
+    }
+
+    /** Framed adapter: prologue, native stack args, call, epilogue, ret. */
+    void emitFramedCall(ByteBuffer buf, long address, Class<?> returnType,
+                        Class<?>[] parameterTypes, Annotation[][] annotations) {
+        throw new UnsupportedOperationException(
+                "Framed calls are not supported on this architecture");
+    }
+
+    /**
+     * Same as {@link #emitFramedCall} but with a five-byte {@code call rel32}
+     * placeholder for JVMCI to bind. Returns the placeholder offset, or -1
+     * when unsupported.
+     */
+    int emitDirectFramedCall(ByteBuffer buf, Class<?> returnType,
+                             Class<?>[] parameterTypes, Annotation[][] annotations) {
+        return -1;
+    }
+
+    /**
      * Emit a real native call followed by the Java-side extension required for
      * sub-word integer returns. A tail jump cannot do this because the C ABI
      * only defines AL/AX for these types, while compiled Java consumes EAX.
