@@ -7,6 +7,7 @@ group = "one.nalim"
 compileJava {
     options.compilerArgs
             << '--add-modules' << 'jdk.internal.vm.ci'
+            << '--add-exports' << 'java.base/jdk.internal.misc=ALL-UNNAMED'
             << '--add-exports' << 'jdk.internal.vm.ci/jdk.vm.ci.code=ALL-UNNAMED'
             << '--add-exports' << 'jdk.internal.vm.ci/jdk.vm.ci.code.site=ALL-UNNAMED'
             << '--add-exports' << 'jdk.internal.vm.ci/jdk.vm.ci.hotspot=ALL-UNNAMED'
@@ -27,6 +28,14 @@ jar {
                 'Premain-Class': 'one.nalim.Agent'
         )
     }
+    from(rootDir) {
+        include 'fabric.mod.json'
+    }
+    doFirst {
+        if (!file('fabric.mod.json').isFile()) {
+            throw new GradleException('Missing fabric.mod.json')
+        }
+    }
 }
 
 sourceSets {
@@ -38,7 +47,6 @@ sourceSets {
 }
 
 java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(11)
-    }
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
 }

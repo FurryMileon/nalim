@@ -1,4 +1,5 @@
 /out/
+/nalim-runtime*/
 /.idea/
 *.iml
 .gradle
@@ -9,3 +10,6 @@ build
 *.dylib
 *.dll
 **/target/
+/test/probe_classes/
+/test/win_abi_harness
+/test/win_adapter_*.bin

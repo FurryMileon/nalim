@@ -12,17 +12,17 @@ package one.nalim;
 import java.lang.reflect.Method;
 
 /**
- * Opens {@code jdk.internal.vm.ci/jdk.vm.ci.*} packages to the calling unnamed modules
- * at runtime, without needing the Nalim Java agent or the {@code --add-exports} JVM
- * flags. This makes Nalim usable inside isolated module layers (e.g. Fabric's knot
- * class loader) with only {@code -XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI}.
+ * Exports {@code java.base/jdk.internal.misc} and the
+ * {@code jdk.internal.vm.ci/jdk.vm.ci.*} packages to the calling unnamed
+ * modules at runtime, without needing the Nalim Java agent or explicit
+ * {@code --add-exports} flags. This keeps Nalim usable inside isolated class
+ * loaders (for example, Fabric's Knot loader) with only JVMCI enabled.
  * <p>
- * Mechanism: locate {@code Module.implAddExports(String, Module)} reflectively, bypass
- * the {@code setAccessible} check via {@link JavaInternals#setAccessible} (which writes
- * the {@code AccessibleObject.override} field through {@code Unsafe}), and invoke it
- * for each JVMCI subpackage targeting the platform- and system-classloader unnamed
- * modules. This deliberately mimics what {@link Agent#premain} does via the official
- * {@code Instrumentation} API.
+ * The opener locates {@code Module.implAddExports(String, Module)}
+ * reflectively. Ordinary reflective access is used when {@code java.lang} is
+ * already open; the lazy {@link JavaInternals} compatibility bootstrap is used
+ * otherwise. The exports target the platform, system, and Nalim unnamed
+ * modules, mirroring {@link Agent#premain}'s official Instrumentation path.
  * <p>
  * Crucially, this class itself does NOT reference any {@code jdk.vm.ci.*} type, so it
  * can be loaded and executed BEFORE the JVMCI packages are open.
@@ -42,13 +42,13 @@ public final class ModuleOpener {
     private ModuleOpener() {}
 
     /**
-     * Reflectively call {@code Module.implAddOpens(String, Module)} on any
-     * module + package. Performs the same Unsafe-bypass of the
-     * {@code setAccessible} check used by {@link #openJvmci()}, so callers
-     * do NOT need {@code --add-opens java.base/java.lang=ALL-UNNAMED}.
+     * Reflectively calls {@code Module.implAddOpens(String, Module)} for a
+     * module and package. Uses the same ordinary-reflection-first compatibility
+     * path as {@link #openJvmci()}, so callers do not need
+     * {@code --add-opens java.base/java.lang=ALL-UNNAMED}.
      * <p>
-     * Usage example — open {@code java.nio} so Oxidizium's cramming module
-     * can read {@code Buffer.address} via reflection without a JVM flag:
+     * Usage example — open {@code java.nio} before reading
+     * {@code Buffer.address} reflectively without a JVM flag:
      * <pre>
      * ModuleOpener.opensPackage("java.base", "java.nio");
      * </pre>
@@ -85,18 +85,28 @@ public final class ModuleOpener {
 
         Module jvmci = ModuleLayer.boot().findModule("jdk.internal.vm.ci")
                 .orElseThrow(() -> new IllegalStateException(
-                        "JVMCI module not found. Use -XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI"));
+                        "JVMCI module not found. Add --add-modules=jdk.internal.vm.ci; "
+                                + "JDK 21-24 also require "
+                                + "-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI"));
 
         try {
             Method addExports = Module.class.getDeclaredMethod(
                     "implAddExports", String.class, Module.class);
-            JavaInternals.setAccessible(addExports);   // Unsafe-based override bypass
+            JavaInternals.setAccessible(addExports);   // ordinary reflection or lazy fallback
 
             // Open to every unnamed module we can reach. Fabric's knot lives in its own
             // unnamed module; some users will load Nalim from the system/platform CL.
             Module system   = ClassLoader.getSystemClassLoader().getUnnamedModule();
             Module platform = ClassLoader.getPlatformClassLoader().getUnnamedModule();
             Module here     = ModuleOpener.class.getModule();
+            Module javaBase = Object.class.getModule();
+            addExports.invoke(javaBase, "jdk.internal.misc", system);
+            if (platform != system) {
+                addExports.invoke(javaBase, "jdk.internal.misc", platform);
+            }
+            if (here != system && here != platform) {
+                addExports.invoke(javaBase, "jdk.internal.misc", here);
+            }
 
             for (String pkg : JVMCI_PACKAGES) {
                 addExports.invoke(jvmci, pkg, system);
@@ -109,14 +119,14 @@ public final class ModuleOpener {
             }
             done = true;
         } catch (NoSuchMethodException e) {
-            // Method.implAddExports moved or renamed — bail out, the user must add the
-            // five --add-exports flags manually (or use -javaagent:nalim.jar).
+            // Module.implAddExports moved or renamed — require explicit exports
+            // or the Java agent instead of continuing with partial access.
             throw new IllegalStateException(
-                    "Could not locate java.lang.Module.implAddExports — " +
-                    "either use -javaagent:nalim.jar, or add the five " +
-                    "--add-exports=jdk.internal.vm.ci/jdk.vm.ci.*=ALL-UNNAMED flags.", e);
+                    "Could not locate java.lang.Module.implAddExports — use -javaagent:nalim.jar, " +
+                    "or add --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED and the five " +
+                    "jdk.internal.vm.ci exports.", e);
         } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException("Failed to open JVMCI packages reflectively", e);
+            throw new IllegalStateException("Failed to open JDK internal packages reflectively", e);
         }
     }
 }

@@ -3,23 +3,37 @@
 Nalim is a library for linking Java methods to native functions using
 [JVMCI](https://openjdk.org/jeps/243) (JVM compiler interface).
 
-Unlike other Java frameworks for native library access, nalim does not
-use JNI and therefore does not incur [JNI related overhead](https://stackoverflow.com/a/24747484/3448419).
+Unlike other Java native-access frameworks, Nalim does not use JNI and avoids
+its transition overhead.
 
-When calling a native function with nalim
- - a thread does not switch from `in_Java` to `in_native` state and back;
- - no memory barrier is involved;
- - no JNI handles are created;
- - exception checks and safepoint checks are omitted;
- - native function can access primitive arrays directly in the heap.
+When Nalim calls a native function:
 
-As a result, native calls become faster comparing to JNI, especially when
-a target function is short. In this sense, nalim is similar to
-[JNI Critical Natives](https://stackoverflow.com/a/36309652/3448419),
-but relies on a standard supported interface. JNI Critical Natives
-have been [deprecated](https://bugs.openjdk.org/browse/JDK-8233343) in JDK 16
-and [obsoleted](https://bugs.openjdk.org/browse/JDK-8258192) since JDK 18,
-so nalim can serve as a replacement.
+- the thread does not switch from `in_Java` to `in_native` and back;
+- no memory barrier is involved;
+- no JNI handles are created;
+- exception and safepoint checks are omitted;
+- primitive arrays can be accessed directly in the Java heap.
+
+This matters most for short native functions, where transition cost would
+otherwise dominate the call. Nalim is similar in spirit to
+[JNI Critical Natives](https://stackoverflow.com/a/36309652/3448419), which
+were [deprecated](https://bugs.openjdk.org/browse/JDK-8233343) in JDK 16 and
+[obsoleted](https://bugs.openjdk.org/browse/JDK-8258192) in JDK 18.
+
+### Maintained branch
+
+This repository follows the original [apangin/nalim](https://github.com/apangin/nalim)
+design and keeps it usable on current HotSpot releases. The main additions are:
+
+- executable nmethod entry barriers for JDK 21 and newer;
+- conservative x86-64 auto-inlining, direct tail calls and narrow-return bridges;
+- System V and Windows x64 calling-convention fixes;
+- runtime module opening, so normal use does not need a long list of
+  `--add-exports` options;
+- version-aware runtime-image builders for Linux, macOS and Windows.
+
+The jar also contains Fabric metadata and can be shipped as a library mod. It
+does not depend on Fabric API.
 
 ### Examples
 
@@ -133,8 +147,8 @@ explicit whitelist of encodings:
    (`andn/blsr/blsi/blsmsk/bzhi/pdep/pext/mulx/shlx/sarx/shrx/rorx`)
    and `vzeroupper` — libraries built with `-march=x86-64-v3` /
    `-C target-cpu=x86-64-v3` stay on the inline path;
- - multi-prefix alignment NOPs and `pause`, so `-O2` loop padding
-   does not break inlining.
+ - multi-prefix alignment NOPs, `pause`, and Intel CET `ENDBR64` / `ENDBR32`
+   landing pads, so compiler-generated entry and loop padding stays inlineable.
 
 The verified control-flow graph allows conditional branches in either
 direction — **loops inline** — and unconditional forward/backward `jmp
@@ -158,17 +172,11 @@ functions use a real-call bridge when every argument is register-resident; a
 narrow-return signature requiring native stack arguments is rejected explicitly.
 Non-AMD64 narrow native returns are not supported yet.
 
-With the current Rustmi Linux library, 56 of 142 bindings were auto-inlined by
-the previous forward-only decoder. The extended decoder matters most for
-modern-tuned builds: on `bench_rng_rust` compiled with
-`-C target-cpu=x86-64-v3`, acceptance goes from 3 of 14 (old decoder) to
-10 of 14 — VEX scalar float and BMI2 integer encodings no longer knock a
-function off the inline path. The two paths can be forced for
-correctness/performance A/B testing with `-Dnalim.noinline=true` and
-`-Dnalim.nodirect=true`; `-Dnalim.trace.inline=true` logs per-symbol decisions
-with the bail-out opcode, and `-Dnalim.dump=<dir>` writes every installed
-nmethod (post-relocation, exactly what the CPU executes) to
-`<dir>/<Class>.<method>.bin` for `objdump -D -b binary -m i386:x86-64`.
+Inlining decisions can be inspected with `-Dnalim.trace.inline=true`.
+`-Dnalim.noinline=true` and `-Dnalim.nodirect=true` force the fallback paths
+for correctness and performance comparisons. `-Dnalim.dump=<dir>` writes each
+installed nmethod after relocation to `<dir>/<Class>.<method>.bin`, ready for
+inspection with `objdump -D -b binary -m i386:x86-64`.
 
 On AMD64 with JDK 21+, the installed nmethod begins with HotSpot's executable
 entry barrier. Its exact 32-byte frame and runtime call live on an out-of-line
@@ -198,43 +206,118 @@ public static native int add(int a, int b);
 Java register convention: it suppresses the register shuffle. It is no longer a
 requirement for auto-inline; ordinary System V leaf functions are handled too.
 
+### Building
+
+The Gradle build uses the JDK running Gradle and targets Java 11 bytecode:
+
+```bash
+gradle clean jar
+```
+
+For a small dependency-free build:
+
+```bash
+./build.sh
+```
+
+Gradle writes `build/libs/nalim.jar`; `build.sh` refreshes the root
+`nalim.jar`. Both jars contain `Premain-Class` and Fabric metadata.
+
 ### Running
 
-#### 1. As an agent
+Nalim uses `jdk.internal.vm.ci`. That module must be resolved before application
+classes start loading; a stock JDK 25 or 26 launch without
+`--add-modules=jdk.internal.vm.ci` fails with
+`NoClassDefFoundError: jdk/vm/ci/code/CompiledCode`.
 
-```
-java -XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI \
-     -javaagent:nalim.jar -cp <classpath> MainClass
+#### Flag-free runtime image
+
+The supplied `jlink` builders bake the version-specific JVM options into a
+separate runtime:
+
+```bash
+JAVA_HOME=/path/to/jdk-25 ./build-runtime.sh
+./nalim-runtime/bin/java -cp nalim.jar:app.jar MainClass
 ```
 
-This is the simplest way to add nalim to your application,
-as the agent exports all required JDK internal packages for you.
+Windows:
 
-The agent optionally accepts a list of classes whose native methods
-will be automatically linked at startup:
+```powershell
+$env:JAVA_HOME = "C:\path\to\jdk-25"
+.\build-runtime.ps1
+.\nalim-runtime\bin\java.exe -cp "nalim.jar;app.jar" MainClass
 ```
+
+The builders support JDK 21 and newer and refuse to overwrite an existing
+output directory. Pass a path as the first argument to use a name other than
+`nalim-runtime`.
+
+The image contains all modules from the selected JDK and bakes these startup
+defaults:
+
+| JDK | Options embedded in the image |
+| --- | --- |
+| 21–24 | `-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI`, JVMCI module, module open, native access |
+| 25 | JVMCI module, module open, native access |
+| 26+ | Same as 25, plus `-XX:-UseCodeCacheFlushing` |
+
+Runtime images are tied to the JDK vendor/version, OS and CPU architecture used
+to build them. Keep the generated `legal/` directory when redistributing one.
+To leave an existing service command unchanged, point `PATH` at the image:
+
+```bash
+export PATH=/opt/nalim-runtime/bin:$PATH
+java -cp nalim.jar:app.jar MainClass
+```
+
+#### Stock JDK
+
+The minimum JVMCI options are:
+
+| JDK | Required JVM options |
+| --- | --- |
+| 21–24 | `-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI --add-modules=jdk.internal.vm.ci` |
+| 25 | `--add-modules=jdk.internal.vm.ci` |
+| 26+ | `--add-modules=jdk.internal.vm.ci`; add `-XX:-UseCodeCacheFlushing` for long-running processes |
+
+`--enable-native-access=ALL-UNNAMED` is recommended on current JDKs. Without it,
+library loading still works today but emits a restricted-access warning, and a
+future JDK may deny the operation by default.
+
+On JDK 26, cold code-cache flushing can discard an idle nmethod installed by
+Nalim. Hot methods are protected by the entry barrier, but an externally
+installed body cannot be recompiled after it has been flushed. Long-running
+servers should therefore use `-XX:-UseCodeCacheFlushing`; the runtime builder
+adds it automatically.
+
+Using the Java agent:
+
+```bash
+java --add-modules=jdk.internal.vm.ci \
+     --enable-native-access=ALL-UNNAMED \
+     -javaagent:nalim.jar \
+     -cp <classpath> MainClass
+```
+
+The agent may also link classes at startup:
+
+```bash
 -javaagent:nalim.jar=com.example.MyLib,com.example.OtherLib
 ```
 
-#### 2. On the classpath
+Using Nalim directly from the classpath:
 
-The current build opens the JVMCI packages before their classes are resolved, so
-the classpath form normally needs only the two JVMCI flags as well:
-
-```
-java -XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI \
-     --enable-native-access=ALL-UNNAMED                 \
+```bash
+java --add-modules=jdk.internal.vm.ci \
+     --add-opens=java.base/java.lang=ALL-UNNAMED \
+     --enable-native-access=ALL-UNNAMED \
      -cp nalim.jar:app.jar MainClass
 ```
 
-`--enable-native-access` suppresses the restricted-native-access warning on
-recent JDKs. The reflective package opener reports the equivalent manual
-`--add-exports`/`--add-opens` fallback if a future JVM blocks this mechanism.
-
-On JDK 26, add `-XX:-UseCodeCacheFlushing` when a linked native method may stay
-idle for many GC cycles and then be used again. JDK 26 permits idle native
-nmethods to be cold-flushed, but it cannot recompile a body installed by Nalim.
-Actively called methods are protected by the executable entry barrier.
+The classpath bootstrap opens the required JVMCI exports itself.
+`--add-opens=java.base/java.lang=ALL-UNNAMED` is optional on current JDKs, but
+it avoids the compatibility fallback through terminally deprecated
+`sun.misc.Unsafe`. Explicit JVMCI `--add-exports` options are not required.
 
 ### Performance
 
@@ -250,14 +333,9 @@ forks, average ns/op):
 That is a 3.05–3.54x advantage over Panama critical on JDK 25 and a
 2.99–3.77x advantage on JDK 26 for these minimal-call overhead tests.
 
-The seven newly accepted forward-branch Rustmi leaves measure 1.033–1.463 ns/op
-with Nalim versus 3.353–5.133 ns/op with Panama critical on JDK 25: a
-2.51–3.90x advantage. A forced-fallback A/B run shows clear 14–56% gains for six
-of those leaves and statistical parity for `clamped_map_float`.
-
-Functions newly accepted by the loop/jmp/VEX/BMI decoder, measured inline vs
-forced stub (`-Dnalim.noinline`) under identical conditions (JDK 25, same
-host, best of 5 × ≥20M direct-loop iterations):
+Auto-inlining helps most when a short function has a serial dependency chain
+that cannot hide the fallback jump. Representative bundled fixtures, measured
+inline versus the forced stub path on JDK 25:
 
 | Function | inline | stub (direct jmp) | gain |
 | --- | ---: | ---: | ---: |
@@ -295,8 +373,9 @@ cold-flush protection for ~1%). `-Dnalim.legacypad=true` likewise restores the
 old 1-byte-NOP prologue padding; the coalesced wide-NOP default measured
 identical on Zen 4 and simply spends fewer decode slots.
 
-The same current jar was also compared with Membrane on JDK 17, the newest JDK
-on which the local Membrane build can install its generated nmethods:
+The same current jar was also compared with
+[Membrane](https://github.com/RelativityMC/MembraneFFI) on JDK 17, the newest
+JDK on which the local Membrane build can install its generated nmethods:
 
 | Binding | Nalim | Membrane | Nalim advantage |
 | --- | ---: | ---: | ---: |
@@ -340,22 +419,21 @@ JniBench.max_nalim      1000  avgt   10  418,057 ± 0,529  ns/op
 
 ### Supported platforms
 
- - **Linux:** amd64 aarch64
- - **macOS:** amd64 aarch64
- - **Windows:** amd64
+- **Linux:** amd64, aarch64
+- **macOS:** amd64, aarch64
+- **Windows:** amd64
 
 ### Limitations
 
-A native function called with nalim has certain limitations comparing to a regular
-JNI function.
+A native function linked with Nalim has several constraints compared with a
+regular JNI function:
 
 1. It must be `static`.
-2. It does not have access to `JNIEnv` and therefore cannot call JNI functions,
-   in particular, it cannot throw exceptions.
-3. Only primitive types, primitive arrays and plain objects with primitive fields
-   can be passed as arguments.
-4. A function must return as soon as possible, since it blocks JVM from reaching 
-   a safepoint.
+2. It cannot access `JNIEnv`, call JNI functions or throw Java exceptions.
+3. Arguments are limited to primitive values, primitive arrays and plain
+   objects containing primitive fields.
+4. It must return quickly because the call prevents the JVM from reaching a
+   safepoint.
 
-Due to JVMCI limitation in HotSpot, nalim works only with Parallel, Serial and G1 GC,
-and also with ZGC since JDK 21.
+Due to JVMCI limitations in HotSpot, Nalim works with Parallel, Serial and G1,
+and with ZGC on JDK 21 and newer.

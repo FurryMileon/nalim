@@ -24,7 +24,7 @@ public class CoverageProbe {
         Linker.loadLibrary(lib);
 
         Method probe = Linker.class.getDeclaredMethod("tryInlineSmallFunction",
-                ByteBuffer.class, long.class, String.class, Class.class);
+                ByteBuffer.class, long.class, String.class, Class.class, List.class);
         probe.setAccessible(true);
 
         int accepted = 0, total = 0;
@@ -36,7 +36,8 @@ public class CoverageProbe {
             if (address == 0) continue;
             total++;
             ByteBuffer buf = ByteBuffer.allocate(1024).order(ByteOrder.nativeOrder());
-            boolean ok = (Boolean) probe.invoke(null, buf, address, symbol, long.class);
+            boolean ok = (Boolean) probe.invoke(
+                    null, buf, address, symbol, long.class, new ArrayList<long[]>());
             if (ok) {
                 accepted++;
                 acceptedNames.add(symbol);

@@ -2,8 +2,8 @@
 // function is a small leaf mirrored bit-exactly in InlineFixturesTest.java.
 //
 // Built twice with different symbol suffixes:
-//   gcc -O2 -shared -fPIC -fno-stack-protector -DFXSUF=_base -o libnalim_fx_base.so nalim_inline_fixtures.c
-//   gcc -O2 -march=x86-64-v3 -ffp-contract=off -shared -fPIC -fno-stack-protector -DFXSUF=_v3 -o libnalim_fx_v3.so nalim_inline_fixtures.c
+//   gcc -O2 -fno-tree-vectorize -shared -fPIC -fno-stack-protector -DFXSUF=_base -o libnalim_fx_base.so nalim_inline_fixtures.c
+//   gcc -O2 -fno-tree-vectorize -march=x86-64-v3 -ffp-contract=off -shared -fPIC -fno-stack-protector -DFXSUF=_v3 -o libnalim_fx_v3.so nalim_inline_fixtures.c
 //
 // The v3 build exercises VEX scalar/packed AVX2, FMA and BMI2 encodings; the
 // base build exercises SSE2 + legacy integer encodings of the same bodies.

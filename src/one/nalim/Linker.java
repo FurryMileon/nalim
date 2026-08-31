@@ -51,12 +51,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * Links native methods to the provided machine code using JVMCI.
  */
 public class Linker {
-    // Open jdk.internal.vm.ci/jdk.vm.ci.* to our unnamed module BEFORE any
-    // jdk.vm.ci.* type is first resolved by the JVM. This eliminates the need
-    // for the five --add-exports flags or -javaagent:nalim.jar; only
-    // -XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI remain mandatory.
-    // The static block runs first in clinit order, before the field initializers
-    // below that mention JVMCIBackend / JVMCI.
+    // Open java.base/jdk.internal.misc and jdk.internal.vm.ci/jdk.vm.ci.*
+    // before the JVM resolves the JVMCI types below. This replaces the old
+    // --add-exports list and makes -javaagent optional. The JVMCI module must
+    // still be resolved at startup (--add-modules on JDK 25+; JDK 21-24 also
+    // require UnlockExperimentalVMOptions + EnableJVMCI).
     static {
         ModuleOpener.openJvmci();
     }
@@ -398,7 +397,7 @@ public class Linker {
 
         byte[] code = new byte[window];
         for (int i = 0; i < window; i++) {
-            code[i] = JavaInternals.unsafe.getByte(address + i);
+            code[i] = NativeMemory.unsafe.getByte(address + i);
         }
 
         // ── pass 1: decode and validate ─────────────────────────────────
@@ -625,7 +624,7 @@ public class Linker {
             }
             int pool = buf.position();
             for (int k = 0; k < litSize[r]; k++) {
-                buf.put(JavaInternals.unsafe.getByte(litSrc[r] + k));
+                buf.put(NativeMemory.unsafe.getByte(litSrc[r] + k));
             }
             // disp32 := pool − RIP, RIP = address of the next instruction.
             // Both live in the same nmethod, so the distance survives install.
@@ -661,9 +660,10 @@ public class Linker {
      * position-independent x86-64 encodings: register/memory ALU and mov,
      * immediate ALU, shifts/rotates, mul/imul, movzx/movsx/movsxd, cmov/setcc,
      * push/pop, sign extends, inc/dec, bswap, shld/shrd, popcnt/lzcnt/tzcnt,
-     * nop (including multi-prefix alignment padding), mov-imm (incl. movabs
-     * r64, imm64), rep movs/stos, scalar and packed SSE/SSE2/SSE4.1 math, and
-     * the VEX-encoded AVX/AVX2/FMA/BMI subset handled by {@link #decodeVex}.
+     * nop (including multi-prefix alignment padding), CET ENDBR64/ENDBR32
+     * landing pads, mov-imm (incl. movabs r64, imm64), rep movs/stos,
+     * scalar and packed SSE/SSE2/SSE4.1 math, and the VEX-encoded
+     * AVX/AVX2/FMA/BMI subset handled by {@link #decodeVex}.
      * Memory operands must not use absolute addressing;
      * RIP-relative is reported via {@code ripDispOff}/{@code ripLoadSize} and
      * accepted only for pure loads, so the caller can relocate the literal.
@@ -682,7 +682,7 @@ public class Linker {
         }
 
         // Alignment padding emitted inside function bodies (e.g. before loop
-        // heads): (66|2E|3E)* 90, (66|2E|3E)* 0F 1F /0, and F3 90 (pause).
+        // heads), PAUSE, and Intel CET ENDBR64/ENDBR32 landing pads.
         if (b == 0x66 || b == 0x2E || b == 0x3E || b == 0xF3) {
             int nopLen = paddingNopLength(code, off, limit);
             if (nopLen > 0) {
@@ -1337,15 +1337,24 @@ public class Linker {
     }
 
     /**
-     * Length of an alignment-padding NOP at {@code off}: {@code (66|2E|3E)* 90},
-     * {@code (66|2E|3E)* 0F 1F /0} or {@code F3 90} (pause). Returns 0 when the
-     * bytes are not such a form.
+     * Length of an alignment-padding instruction at {@code off}:
+     * {@code (66|2E|3E)* 90}, {@code (66|2E|3E)* 0F 1F /0},
+     * {@code F3 90} (pause), or the CET landing pads {@code ENDBR64} and
+     * {@code ENDBR32}. Returns 0 when the bytes are not one of these forms.
      */
     private static int paddingNopLength(byte[] code, int off, int limit) {
         int p = off;
         int c = u(code, p, limit);
         if (c == 0xF3) {
-            return u(code, p + 1, limit) == 0x90 ? 2 : 0;
+            int c1 = u(code, p + 1, limit);
+            if (c1 == 0x90) {
+                return 2;
+            }
+            if (c1 == 0x0F && u(code, p + 2, limit) == 0x1E) {
+                int endbr = u(code, p + 3, limit);
+                return endbr == 0xFA || endbr == 0xFB ? 4 : 0;
+            }
+            return 0;
         }
         while (c == 0x66 || c == 0x2E || c == 0x3E) {
             c = u(code, ++p, limit);
@@ -1569,10 +1578,10 @@ public class Linker {
 
         // Keep verified-entry patching and GC barrier patching disjoint: HotSpot
         // may replace the first five bytes with a NativeJump when the nmethod is
-        // made non-entrant (make_not_entrant still calls patch_verified_entry on
-        // JDK 25), while the barrier immediate remains independently patchable
-        // at patchOffset below.
-        buf.put((byte) 0x0F).put((byte) 0x1F).put((byte) 0x44).put((byte) 0x00).put((byte) 0x00);
+        // made non-entrant, while the barrier immediate remains independently
+        // patchable at patchOffset below.
+        buf.put((byte) 0x0F).put((byte) 0x1F).put((byte) 0x44)
+                .put((byte) 0x00).put((byte) 0x00);
         emitNopPad(buf, 4);
 
         // Canonical eight-byte CMP. Its imm32 starts four bytes into the
@@ -1768,7 +1777,7 @@ public class Linker {
                     if (p < 0 || p >= buf.position() || insideRebaseField(p, rebases)) {
                         continue;
                     }
-                    if (JavaInternals.unsafe.getByte(start + p) != buf.get(p)) {
+                    if (NativeMemory.unsafe.getByte(start + p) != buf.get(p)) {
                         throw new IllegalStateException(
                                 "nalim: installed code does not mirror the buffer at +0x"
                                         + Integer.toHexString(p) + ": " + m);
@@ -1784,7 +1793,8 @@ public class Linker {
                 }
             }
             for (long[] r : rebases) {
-                JavaInternals.unsafe.putInt(start + (int) r[0], (int) (r[2] - (start + (int) r[1])));
+                NativeMemory.unsafe.putInt(
+                        start + (int) r[0], (int) (r[2] - (start + (int) r[1])));
             }
         } catch (Throwable t) {
             // The nmethod is already the method's default code; never leave a

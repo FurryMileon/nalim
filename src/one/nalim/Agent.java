@@ -39,7 +39,10 @@ public class Agent {
     private static void openJvmciPackages(Instrumentation inst) {
         Optional<Module> jvmciModule = ModuleLayer.boot().findModule("jdk.internal.vm.ci");
         if (jvmciModule.isEmpty()) {
-            throw new IllegalStateException("JVMCI module not found. Use -XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI");
+            throw new IllegalStateException(
+                    "JVMCI module not found. Add --add-modules=jdk.internal.vm.ci; "
+                            + "JDK 21-24 also require "
+                            + "-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI");
         }
 
         Set<Module> unnamed = Set.of(
@@ -54,6 +57,12 @@ public class Agent {
                 "jdk.vm.ci.meta", unnamed,
                 "jdk.vm.ci.runtime", unnamed
         );
+
+        // Open java.base first: agent arguments may link classes immediately
+        // below, and NativeMemory resolves jdk.internal.misc.Unsafe.
+        inst.redefineModule(Object.class.getModule(), Collections.emptySet(),
+                Map.of("jdk.internal.misc", unnamed), Map.of("java.lang", unnamed),
+                Collections.emptySet(), Collections.emptyMap());
 
         inst.redefineModule(jvmciModule.get(), Collections.emptySet(), extraExports,
                 Collections.emptyMap(), Collections.emptySet(), Collections.emptyMap());

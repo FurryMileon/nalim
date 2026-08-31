@@ -26,9 +26,16 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
 class JavaInternals {
-    public static final Unsafe unsafe = getUnsafe();
+    private static final long ACCESSIBLE_OFFSET_UNINITIALIZED = -1;
+    private static volatile long accessibleOffset = ACCESSIBLE_OFFSET_UNINITIALIZED;
 
-    private static final long accessibleOffset = getAccessibleOffset();
+    private static final class UnsafeHolder {
+        static final Unsafe INSTANCE = getUnsafe();
+    }
+
+    private static Unsafe unsafe() {
+        return UnsafeHolder.INSTANCE;
+    }
 
     private static Unsafe getUnsafe() {
         try {
@@ -38,24 +45,29 @@ class JavaInternals {
         }
     }
 
-    private static long getAccessibleOffset() {
-        boolean hasModules = !System.getProperty("java.version").startsWith("1.");
-        if (hasModules) {
-            try {
-                Method m0 = JavaInternals.class.getDeclaredMethod("getAccessibleOffset");
-                Method m1 = JavaInternals.class.getDeclaredMethod("getAccessibleOffset");
-                m1.setAccessible(true);
-
-                // Work around JDK 17 restrictions on calling setAccessible()
-                for (long offset = 8; offset < 128; offset++) {
-                    if (unsafe.getByte(m0, offset) == 0 && unsafe.getByte(m1, offset) == 1) {
-                        return offset;
-                    }
-                }
-            } catch (Exception e) {
-                // Fall back to default setAccessible() implementation
-            }
+    private static synchronized long accessibleOffset() {
+        if (accessibleOffset != ACCESSIBLE_OFFSET_UNINITIALIZED) {
+            return accessibleOffset;
         }
+        try {
+            Method m0 = JavaInternals.class.getDeclaredMethod("accessibleOffset");
+            Method m1 = JavaInternals.class.getDeclaredMethod("accessibleOffset");
+            m1.setAccessible(true);
+
+            // Work around strong encapsulation only when ordinary reflective
+            // access failed. The Java agent opens java.lang, so agent-based
+            // launches never use this Unsafe fallback.
+            Unsafe unsafe = unsafe();
+            for (long offset = 8; offset < 128; offset++) {
+                if (unsafe.getByte(m0, offset) == 0 && unsafe.getByte(m1, offset) == 1) {
+                    accessibleOffset = offset;
+                    return offset;
+                }
+            }
+        } catch (ReflectiveOperationException | SecurityException ignored) {
+            // The caller below will retry setAccessible and report its error.
+        }
+        accessibleOffset = 0;
         return 0;
     }
 
@@ -90,10 +102,15 @@ class JavaInternals {
     }
 
     public static void setAccessible(AccessibleObject ao) {
-        if (accessibleOffset != 0) {
-            unsafe.putByte(ao, accessibleOffset, (byte) 1);
+        if (ao.trySetAccessible()) {
+            return;
+        }
+        long offset = accessibleOffset();
+        if (offset != 0) {
+            unsafe().putByte(ao, offset, (byte) 1);
         } else {
             ao.setAccessible(true);
         }
     }
+
 }

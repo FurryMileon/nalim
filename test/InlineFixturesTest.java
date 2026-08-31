@@ -87,6 +87,8 @@ public class InlineFixturesTest {
         @Link static native byte fxa_parity8(long x, long n);
         @Link static native long fxa_two_rets(long x);
         @Link static native long fxa_cmov_set(long x, long y);
+        @Link static native long fxa_endbr64(long x);
+        @Link static native long fxa_endbr32(long x);
     }
 
     // ── link + inline coverage report ──────────────────────────────────
@@ -310,6 +312,8 @@ public class InlineFixturesTest {
             long c = rnd.nextLong(1, 64);
             eq(Asm.fxa_shrd_cl(x, y, c), (x >>> c) | (y << (64 - c)), "fxa_shrd_cl");
             eq(Asm.fxa_padded_nop(x), x * 2, "fxa_padded_nop");
+            eq(Asm.fxa_endbr64(x), x + 64, "fxa_endbr64");
+            eq(Asm.fxa_endbr32(x), x + 32, "fxa_endbr32");
             eq(Asm.fxa_bmi(x, y), mBmi(x, y), "fxa_bmi");
             eq(Asm.fxa_mulx(x, y), Math.unsignedMultiplyHigh(x, y) ^ (x * y), "fxa_mulx");
             eq(Asm.fxa_popcnts(x), Long.bitCount(x)

@@ -1,0 +1,13 @@
+{
+    "schemaVersion": 1,
+    "id": "nalim",
+    "version": "1.2.0-patched-autoinline",
+    "name": "Nalim",
+    "description": "Near-zero-overhead JVMCI native linking with JDK 21+ entry barriers and AMD64 auto-inlining.",
+    "authors": ["Andrei Pangin", "FurryMileon"],
+    "license": "GPL-2.0-or-later",
+    "environment": "*",
+    "depends": {
+        "java": ">=11"
+    }
+}

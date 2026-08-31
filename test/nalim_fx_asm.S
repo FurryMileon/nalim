@@ -243,6 +243,18 @@ FUNC(fxa_cmov_set)              // (rdi, rsi) -> max + (rdi==rsi)
     add rax, rcx
     ret
 
+// Intel CET branch-target landing pads. Exact bytes keep this deterministic
+// even when the assembler or distro defaults do not enable -fcf-protection.
+FUNC(fxa_endbr64)               // (rdi) -> rdi+64
+    .byte 0xf3, 0x0f, 0x1e, 0xfa
+    lea rax, [rdi+64]
+    ret
+
+FUNC(fxa_endbr32)               // (rdi) -> rdi+32
+    .byte 0xf3, 0x0f, 0x1e, 0xfb
+    lea rax, [rdi+32]
+    ret
+
     .section .rodata
     .p2align 5
 .LK32:
