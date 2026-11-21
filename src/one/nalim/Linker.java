@@ -245,9 +245,12 @@ public class Linker {
             throw new IllegalArgumentException("Symbol not found: " + symbol);
         }
 
-        Class<?>[] types = m.getParameterTypes();
-        boolean framed = !naked && callingConvention.requiresFramedCall(types);
         Class<?> returnType = m.getReturnType();
+        boolean normalizeReturn = CallingConvention.needsReturnNormalization(returnType);
+        // Java-ABI bodies have no shuffle. Only narrow return bridges need to
+        // inspect their parameters, since spilling across the nested call is unsupported.
+        Class<?>[] types = !naked || normalizeReturn ? m.getParameterTypes() : null;
+        boolean framed = !naked && callingConvention.requiresFramedCall(types);
         boolean pendingScalarShuffle = SYSV_AMD64 && !naked && !framed && !NO_INLINE
                 && AMD64ScalarLeaf.accepts(returnType, types);
         // 128 bytes covers the entry barrier, six disp32 LEAs and the largest
@@ -297,7 +300,7 @@ public class Linker {
                     return scratch;
                 }
             }
-            if (CallingConvention.needsReturnNormalization(returnType)) {
+            if (normalizeReturn) {
                 directJump = tryEmitDirectNarrowCall(buf, address, returnType, types);
                 if (directJump == null) {
                     callingConvention.emitCallAndNormalize(buf, address, returnType, types);
