@@ -1,48 +1,50 @@
 # Nalim v2
 
-Nalim связывает Java-метод с короткой функцией на C или Rust через JVMCI в HotSpot. Выигрыш появляется там, где Java часто вызывает нативный код. Сам по себе `nalim.jar` не меняет ни одного игрового тика: на сервере библиотекой должен пользоваться мод, например RustMi.
+Nalim uses HotSpot's JVMCI to link Java methods to short C or Rust functions. It cuts call overhead when Java calls native code in a hot loop. On a Minecraft server, a mod such as RustMi has to use Nalim for it to affect tick time. Installing `nalim.jar` alone won't speed up the server.
 
-**[Скачать nalim.jar 1.2.5](https://raw.githubusercontent.com/FurryMileon/nalim/84fb642e623218f05c2a04439d5153439e906cef/nalim.jar)** · [English guide & ABI reference for this jar](https://github.com/FurryMileon/nalim/blob/84fb642e623218f05c2a04439d5153439e906cef/README.md)
+**[Download nalim.jar 1.2.5](https://raw.githubusercontent.com/FurryMileon/nalim/84fb642e623218f05c2a04439d5153439e906cef/nalim.jar)** · [Binding and ABI reference for this build](https://github.com/FurryMileon/nalim/blob/84fb642e623218f05c2a04439d5153439e906cef/README.md)
 
-- **Держите сервер Minecraft?** [Включите Nalim в RustMi и проверьте две строки в логе.](#сервер-с-rustmi) Править Java-код не нужно.
-- **Пишете мод или библиотеку?** [Выберите способ вызова.](#интеграция-в-java) Для массива выгодно сократить число вызовов. Для некоторых коротких функций можно убрать нативный вызов из горячего цикла совсем.
-- **Нужны цифры?** [Замеры и команды для сравнения на вашем железе.](#замеры)
+- [Run RustMi with Nalim](#run-rustmi-with-nalim) to enable the backend and check which version the server loaded. No Java changes needed.
+- [Call native code from Java](#call-native-code-from-java) to process an array in one call or let HotSpot inline a small integer function into your loop.
+- [Reproduce the benchmarks](#benchmarks) to see which calls got faster and by how much.
 
-## Сервер с RustMi
+## Run RustMi with Nalim
 
-Инструкция для **Minecraft 26.3, Fabric, [RustMi](https://github.com/DUzzL/RustMi) и Linux x86-64** (Intel или AMD). Начните с обычного HotSpot **JDK 25** и стандартного сборщика G1. На других системах не форсируйте Nalim: у RustMi есть запасной backend FFM.
+These instructions are for **Minecraft 26.3 with Fabric and [RustMi](https://github.com/DUzzL/RustMi) on Linux x86-64** (Intel or AMD). Start with HotSpot JDK 25 and its default G1 collector. On other platforms, let RustMi select its backend; it can use the Foreign Function & Memory API (FFM).
 
-1. Остановите сервер. Оставьте установленный `rustmi-*.jar` в `mods/`. RustMi уже включает Nalim. Если в списке модов Fabric указана версия старее `1.2.5-patched-autoinline`, положите [JAR из этой ветки](https://raw.githubusercontent.com/FurryMileon/nalim/84fb642e623218f05c2a04439d5153439e906cef/nalim.jar) в `mods/`. Если там уже есть отдельная старая копия Nalim, **замените её**. Распаковывать RustMi или ставить `-javaagent` не нужно.
-2. В каталоге сервера запустите команду ниже. В панели хостинга добавьте параметры JVM **до `-jar`**, сохранив свои настройки памяти. **На JDK 26** туда же добавьте `-XX:-UseCodeCacheFlushing`: иначе RustMi не выберет Nalim.
+1. Stop the server. Keep `rustmi-*.jar` in `mods/`: it already bundles Nalim. If Fabric's mod list shows a version older than `1.2.5-patched-autoinline`, put [the v2 JAR](https://raw.githubusercontent.com/FurryMileon/nalim/84fb642e623218f05c2a04439d5153439e906cef/nalim.jar) in `mods/`. Replace any older standalone copy of Nalim. You don't need to unpack RustMi or add `-javaagent`.
+2. Run this command from the server directory. If you use a hosting panel, put the JVM options **before `-jar`** and keep your existing memory settings. **On JDK 26**, also add `-XX:-UseCodeCacheFlushing` before `-jar`; otherwise RustMi won't select Nalim.
 
    ```sh
    java --add-modules=jdk.internal.vm.ci --add-opens=java.base/java.lang=ALL-UNNAMED --enable-native-access=ALL-UNNAMED -jar fabric-server-launch.jar nogui
    ```
 
-3. Проверьте `logs/latest.log`. Нужны **обе** строки: первая показывает, какой JAR выбрал Fabric, вторая — чем RustMi действительно вызывает Rust.
+3. Look for **both** lines in `logs/latest.log`. The first tells you which Nalim JAR Fabric loaded. The second tells you whether RustMi is actually using it.
 
    ```text
    nalim 1.2.5-patched-autoinline
    RustMI native backend: Nalim (JVMCI)
    ```
 
-`/rustmi stats` тоже показывает backend. Если в логе `FFM (…)`, причина указана в скобках. На отдельном тестовом сервере с указанными выше Linux и JDK можно добавить `-Drustmi.backend=nalim`: тогда ошибка запуска не скроется за переключением на FFM. Для возврата к FFM, в том числе на обычных JDK 27 и 28 EA без JVMCI, уберите параметры Nalim и запустите:
+You can also check the backend with `/rustmi stats`. If the log says `FFM (…)`, the reason is in parentheses. To diagnose a failure on a test server with the Linux and JDK setup above, add `-Drustmi.backend=nalim`. RustMi will report the error at startup instead of falling back to FFM. To switch back to FFM, remove the Nalim flags and run the command below. Use this on stock JDK 27 or a JDK 28 EA build without JVMCI as well.
 
 ```sh
 java --enable-native-access=ALL-UNNAMED -Drustmi.backend=ffm -jar fabric-server-launch.jar nogui
 ```
 
-**Как узнать, ускорился ли сервер.** Возьмите одну копию мира и один сценарий нагрузки. Между запусками восстанавливайте эту копию, прогревайте сервер одинаково и чередуйте варианты: A/B, затем B/A. Для сравнения версий меняйте только JAR, оставляя backend `Nalim` в обоих запусках. Для сравнения Nalim с FFM, наоборот, оставьте тот же JAR и меняйте backend. На тестовой копии `/tick sprint 3000` покажет среднее время тика за один прогон. Для игрового сервера смотрите также медиану и p95 **MSPT** (миллисекунд на тик): p95 показывает, сколько времени хватило для 95% тиков. Показатель 20 TPS не различает серверы, которым на тик нужно 5 и 45 мс.
+**Measuring server performance.** Restore the same world snapshot before each run, replay the same workload, and give each server the same warm-up. Alternate the order: A/B, then B/A. To compare Nalim versions, change only the JAR and confirm both runs use `Nalim`. To compare Nalim with FFM, keep the JAR and change only the backend.
 
-## Интеграция в Java
+On a test copy, `/tick sprint 3000` reports the average time per tick for that run. On a live server, compare median and p95 **milliseconds per tick (MSPT)**. The p95 is the time within which 95% of ticks finish. Two servers can both report 20 TPS even if one needs 5 ms per tick and the other needs 45 ms.
 
-**Если функция обрабатывает данные, начните с размера порции.** Вместо нативного `load` на каждый элемент сделайте один вызов на небольшой массив или его часть. Готовый пример: [`nalimSumHeap(long[] p, int n)`](test/BenchMemAccess.java) вызывает [`mem_sum_longs(const int64_t* p, int32_t n)`](test/nalim_mem.c) без промежуточной копии. Загрузите библиотеку и вызовите `Linker.linkClass(...)` один раз при инициализации класса. Сравните с простым циклом на Java: для мелкой работы он может оказаться быстрее.
+## Call native code from Java
 
-Проверяйте `p != null` и `0 <= n <= p.length` **на стороне Java**. Нативная функция не должна сохранять адрес массива после возврата, блокироваться или вызывать Java. Для долгого вычисления, I/O или обратных вызовов используйте JNI или FFM. Сигнатура обязана совпадать с реальным C ABI; для Rust нужен экспорт с `extern "C"`.
+**For arrays, start by making fewer calls.** Pass a small array or a slice to one native function instead of calling a native `load` for each element. For example, [`nalimSumHeap(long[] p, int n)`](test/BenchMemAccess.java) calls [`mem_sum_longs(const int64_t* p, int32_t n)`](test/nalim_mem.c) without copying the array. Load the library and run `Linker.linkClass(...)` once during class initialization. Compare the result with a plain Java loop: Java can be faster when each element needs little work.
 
-**Если часто вызывается одна короткая арифметическая функция**, на Linux x86-64 попробуйте `Linker.findIntrinsic`. Nalim читает машинный код символа и ищет точный Java-эквивалент. Одного совпадения имени недостаточно. Подходят некоторые функции с одним или двумя `int` либо `long`, с таким же типом результата. Если эквивалент найден, HotSpot может встроить его в вызывающий цикл. Обычный `@Link` сам на `MethodHandle` не переключается.
+Check `p != null` and `0 <= n <= p.length` in Java before calling the function. The native code must not keep the array address after it returns, block, or call back into Java. Use JNI or FFM for long computations, I/O, or callbacks. Match the Java signature to the function's C ABI; in Rust, export the function with `extern "C"`.
 
-Пример использует `raw_add` из [`test/nalim_bench.c`](test/nalim_bench.c). Скачайте исходники и сохраните класс ниже как `Demo.java` в каталоге `nalim`:
+**For a short arithmetic function called in a loop**, try `Linker.findIntrinsic` on Linux x86-64. Nalim inspects the compiled function and looks for an exact Java equivalent. The symbol name alone is not enough. It recognizes some functions that take one or two arguments, all `int` or all `long`, and return the same type. If there's a match, HotSpot can inline the Java equivalent into the loop. A plain `@Link` call does not switch to a `MethodHandle` automatically.
+
+This example calls `raw_add` from [`test/nalim_bench.c`](test/nalim_bench.c). Clone v2, then save the class below as `Demo.java` in the `nalim` directory:
 
 ```sh
 git clone --branch v2 https://github.com/FurryMileon/nalim.git
@@ -77,7 +79,7 @@ public final class Demo {
 }
 ```
 
-Из корня репозитория, на **Linux x86-64 с JDK 25** и компилятором C:
+From the repository root on **Linux x86-64 with JDK 25** and a C compiler, run:
 
 ```sh
 cc -O2 -shared -fPIC test/nalim_bench.c -o libnalim_bench.so
@@ -85,22 +87,24 @@ javac -cp nalim.jar Demo.java
 java --add-modules=jdk.internal.vm.ci --add-opens=java.base/java.lang=ALL-UNNAMED --enable-native-access=ALL-UNNAMED -Djava.library.path=. -cp nalim.jar:. Demo
 ```
 
-`intrinsic: 42` означает, что Nalim распознал функцию. `@Link: 42` — что сработал обычный нативный вызов: это нормально, например, при другой генерации кода компилятором C. Чтобы проверить второй путь, добавьте `-Dnalim.noinline=true` перед `-cp` в последней команде; для замеров быстрого пути уберите его. Ищите `MethodHandle` **один раз**, храните в `static final`, вызывайте через `invokeExact` с примитивными типами. Не подменяйте машинный код загруженной функции, пока используете её Java-эквивалент. Обоим путям в этом примере нужен JAR v2: на v1 самого API `findIntrinsic` нет.
+`intrinsic: 42` means Nalim recognized the compiled function. `@Link: 42` means it used the native fallback, which is normal if your C compiler emitted different instructions. To test the fallback, add `-Dnalim.noinline=true` before `-cp` in the last command. Remove it before timing the fast path.
 
-## Замеры
+Look up the `MethodHandle` once, store it in a `static final` field, and call `invokeExact` with the exact primitive types. The function's machine code must stay unchanged while you use its Java equivalent. Both paths in this example require the v2 JAR because v1 has no `findIntrinsic` API.
 
-[`BenchLeafCalls`](test/BenchLeafCalls.java): Linux x86-64, Ryzen AI 9 365, OpenJDK 25.0.5.0.3, G1, одно закреплённое ядро, восемь пар свежих JVM с чередованием порядка. Медианы по процессам, **наносекунды на элемент прогретого цикла**; меньше лучше. На `main` у `MethodHandle` нет Java-эквивалента, и он вызывает тот же нативный метод.
+## Benchmarks
 
-| Операция в цикле | `main` (`d367a5e`) | v2 (`1.2.5`) |
+[`BenchLeafCalls`](test/BenchLeafCalls.java) ran on Linux x86-64 with a Ryzen AI 9 365, OpenJDK 25.0.5.0.3, and G1. Each pair used two fresh JVMs pinned to the same core; the order alternated across eight pairs. The figures are medians across processes, in **nanoseconds per element of a warmed-up loop** (lower is better). On `main`, the benchmark's `MethodHandle` calls the linked native method because that version has no Java equivalent for the call.
+
+| Operation in the loop | `main` (`d367a5e`) | v2 (`1.2.5`) |
 |---|---:|---:|
-| Сложение: обычный `@Link` | 1.1150 | 1.1165 |
-| Сложение: `static final` + `invokeExact` | 1.1195 | 0.0625 |
-| Модуль числа: обычный `@Link` | 0.9022 | 0.9018 |
-| Модуль числа: `static final` + `invokeExact` | 0.9030 | 0.0635 |
+| Add: plain `@Link` | 1.1150 | 1.1165 |
+| Add: `static final` + `invokeExact` | 1.1195 | 0.0625 |
+| Absolute value: plain `@Link` | 0.9022 | 0.9018 |
+| Absolute value: `static final` + `invokeExact` | 0.9030 | 0.0635 |
 
-В таком цикле v2 обработала сложения примерно в **17,9 раза**, а модули числа — в **14,2 раза** быстрее по пути `invokeExact`. Это пропускная способность цикла после оптимизации JIT, **не** задержка отдельного вызова и не множитель TPS. В строках с обычным `@Link` разницы практически нет.
+With `invokeExact`, v2 processed **17.9× as many additions** and **14.2× as many absolute values** per second as `main`. Plain `@Link` took about the same time on both versions. These ratios measure what the JIT can do with the whole loop; they don't predict individual call latency or Minecraft TPS.
 
-Повторить на Linux x86-64: нужны полный клон v2 с историей, JDK 25, `cc`, Python 3 и `taskset`. Запустите из корня репозитория. Скрипт сам выберет доступное ядро; для выбора вручную есть `--cpu` (в таблице — `--cpu 2`).
+To reproduce the comparison on Linux x86-64, use a full v2 clone with Git history, JDK 25, `cc`, Python 3, and `taskset`. Run the following from the repository root. The script picks an available CPU by default; pass `--cpu` to choose one (this run used `--cpu 2`).
 
 ```sh
 (
@@ -112,14 +116,16 @@ java --add-modules=jdk.internal.vm.ci --add-opens=java.base/java.lang=ALL-UNNAME
 )
 ```
 
-В выводе проверьте `raw_add.intrinsic=1` и `raw_abs.intrinsic=1` для `after`. Скрипт проверяет контрольные суммы. Чтобы заодно измерить обычные пути связывания, замените `--workload leaves` на `--workload paths leaves`.
+Look for `raw_add.intrinsic=1` and `raw_abs.intrinsic=1` in the `after` output. The script checks the results against expected checksums. To measure ordinary linking paths too, replace `--workload leaves` with `--workload paths leaves`.
 
-**Что получилось ближе к серверу.** В [тесте сигнатур RustMi](test/BenchRustMiAbi.java) на JDK 26 время вызова `spawncap` упало с 1,369 до 1,199 нс; у `collision` почти не изменилось (2,142 → 2,141 нс), у `distance` слегка выросло (2,084 → 2,097 нс). На реальном тестовом сервере RustMi 1.2.1 и Nalim 1.2.5 прошли на Java 26 проверку столкновений: 8 278 065 совпадений с ванильной логикой, 0 расхождений. Это проверка результата. В более раннем сравнении **серверного** времени тика (Nalim 1.2.1 против 1.2.2) новая версия выиграла только в двух из четырёх пар. Устойчивого выигрыша по MSPT от одной замены JAR эти данные не показывают.
+**RustMi call patterns.** In the [RustMi ABI benchmark](test/BenchRustMiAbi.java) on JDK 26, `spawncap` went from 1.369 to 1.199 ns per call between `main` and v2. `collision` barely changed (2.142 to 2.141 ns), and `distance` took slightly longer (2.084 to 2.097 ns).
 
-## Платформы и сборка
+**Minecraft tick time.** A test server running RustMi 1.2.1 and Nalim 1.2.5 on Java 26 matched vanilla on 8,278,065 collision checks with zero mismatches. That run checked correctness. In a separate, earlier tick-time comparison of Nalim 1.2.1 and 1.2.2, the newer JAR won two of four pairs. Those runs did not show a consistent MSPT improvement from swapping the JAR alone.
 
-- **Библиотека Nalim:** Linux и macOS на x86-64 и AArch64; Windows на x86-64. `amd64` включает и Intel, и AMD. Windows on Arm не поддерживается. [Тесты нативного ABI](.github/workflows/platforms.yml) запускаются на всех пяти сочетаниях с JDK 21, 25 и 26. Это шире, чем набор платформ, где **RustMi** автоматически выбирает Nalim.
-- **Java:** требуется HotSpot с модулем `jdk.internal.vm.ci` (проверьте `java --list-modules`). На JDK 21 к параметрам из примера нужны `-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI`; на JDK 26 — `-XX:-UseCodeCacheFlushing`. На 11 и 17 проверяется только базовый нативный вызов на Linux x86-64. В обычной JDK 27 [JVMCI удалён](https://bugs.openjdk.org/browse/JDK-8385142); в проверенной JDK 28 EA его тоже нет. Добавить отсутствующий модуль флагом нельзя.
-- **Сборка из исходников:** `sh build.sh` в корне создаёт `nalim.jar`. Для проверки готового JAR: `bash test/check-platform.sh nalim.jar` (JDK 21/25/26 и компилятор C; на Windows — Git Bash и GCC). Нужна среда запуска с уже заданными параметрами JVM — см. [`build-runtime.sh`](build-runtime.sh) или [`build-runtime.ps1`](build-runtime.ps1).
+## Platform support and builds
 
-Основано на [Nalim Андрея Пангина](https://github.com/apangin/nalim). [Лицензия GPL-2.0-or-later](LICENSE).
+- **Platforms:** Nalim supports Linux and macOS on x86-64 and AArch64, and Windows on x86-64. `amd64` includes Intel and AMD CPUs. Windows on Arm is unsupported. The [native ABI tests](.github/workflows/platforms.yml) run on all five combinations with JDK 21, 25, and 26. RustMi automatically selects Nalim on a narrower set of platforms.
+- **Java:** Use HotSpot with `jdk.internal.vm.ci` (check `java --list-modules`). On JDK 21, add `-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI` to the example's JVM flags. On JDK 26, add `-XX:-UseCodeCacheFlushing`. On JDK 11 and 17, only the basic native call is tested, and only on Linux x86-64. Stock JDK 27 [removed JVMCI](https://bugs.openjdk.org/browse/JDK-8385142); the JDK 28 EA build we tested also lacks it. A launch flag cannot add a missing module.
+- **Build:** Run `sh build.sh` from the repository root to produce `nalim.jar`. To test an existing JAR, run `bash test/check-platform.sh nalim.jar` with JDK 21, 25, or 26 and a C compiler (Git Bash and GCC on Windows). To build a runtime with the JVM options already set, use [`build-runtime.sh`](build-runtime.sh) or [`build-runtime.ps1`](build-runtime.ps1).
+
+Based on [Andrei Pangin's Nalim](https://github.com/apangin/nalim). [GPL-2.0-or-later](LICENSE).
