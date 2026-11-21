@@ -155,22 +155,72 @@ direction — **loops inline** — and unconditional forward/backward `jmp
 rel8/rel32`, as long as every target lands on a verified instruction boundary
 inside the window. Up to eight RIP-relative constants are relocated from
 non-writable mappings into a local pool aligned up to 32 bytes (ymm literals
-included; requirements above the JVM's `CodeEntryAlignment` are rejected).
+included; requirements above the JVM's `CodeEntryAlignment` cannot use the pool).
 
-Anything containing a call, indirect branch, EVEX (AVX-512) instruction,
-`lock`-prefixed atomic, mutable RIP-relative operand or unknown encoding is
-rejected and remains on the safe fallback path.
+On Linux x86-64, an exported symbol can also be a direct jump to the actual
+implementation. Nalim follows up to four out-of-window entry jumps (`jmp rel8`
+or `jmp rel32`, optionally after `ENDBR64`) inside the **same read-only executable
+mapping**, then verifies the destination as usual. Speculative target and
+cross-page reads go through procfs during binding, not at call time. Indirect
+dispatch slots are never followed; if verification or the read fails, the
+adapter calls the original symbol. The native text must stay unchanged while linked.
+
+A call, indirect branch, EVEX (AVX-512) instruction, `lock`-prefixed atomic
+or unknown encoding stays on the fallback path. RIP-relative loads that
+cannot use the literal pool, and RIP-relative `lea`, can retain their original
+address if it is within rel32 reach; `-Dnalim.norebase=true` disables this.
 On AMD64, that fallback is normally a JVMCI-relocated five-byte `jmp rel32`.
 Nalim retains the old 12-byte `movabs + jmp` sequence when the JVM reports that
 the target is outside the code cache's signed 32-bit reach. Narrow-return
 bridges use a JVMCI-relocated `call rel32` under the same reachability rule.
 
 AMD64 `boolean`, `byte`, `short` and `char` returns are extended to the Java ABI
-width before control returns to compiled Java. A small function with one terminal
-`ret` stays auto-inlined and receives the extension in place. Other narrow-return
-functions use a real-call bridge when every argument is register-resident; a
-narrow-return signature requiring native stack arguments is rejected explicitly.
+width before control returns to compiled Java. For small verified functions
+with multiple exits, Nalim inserts that extension at every reachable `ret` /
+`rep ret` and adjusts the internal branches and RIP operands. If a short
+branch would no longer fit, the original call bridge is used instead.
+On System V AMD64 that bridge requires register-resident arguments.
 Non-AMD64 narrow native returns are not supported yet.
+
+On Linux AMD64, a small set of complete integer functions and single `int`/`long`
+loads or stores can run directly in HotSpot's argument registers. Ordinary
+`@Link` users get this automatically. For a load/store through an array or
+`@FieldOffset`, the CPU instruction combines the JVM-reported base offset and
+the native displacement. This preserves the existing native pointer semantics;
+it does not add Java null or bounds checks.
+
+For hot Java loops calling pure integer leaves, `Linker.findIntrinsic` offers a
+different path: a Java `MethodHandle` that C2 can inline into the **caller**.
+It checks the supplied `MethodType` and the instructions through `ret` in
+readable, non-writable executable text; it does not infer behavior from the
+symbol name. A Linux runtime that denies the required procfs reads gets
+`Optional.empty()`. Bind once, after loading the library:
+
+```java
+final class Maths {
+    @Link(name = "raw_add") private static native int nativeAdd(int x, int y);
+    private static final MethodHandle ADD;
+
+    static {
+        Linker.loadLibrary("mathlib"); // exports int raw_add(int, int)
+        ADD = Linker.findIntrinsic("raw_add",
+                MethodType.methodType(int.class, int.class, int.class)).orElse(null);
+        if (ADD == null) Linker.linkClass(Maths.class);
+    }
+
+    static int add(int x, int y) throws Throwable {
+        return ADD == null ? nativeAdd(x, y) : (int) ADD.invokeExact(x, y);
+    }
+}
+```
+
+The supported shapes are identity, negate, complement, absolute value, add,
+subtract, multiply, and bitwise AND/OR/XOR on homogeneous `int` or `long`
+arguments. A different compiler encoding, an entry thunk, a body crossing a
+4 KiB page boundary, another platform, or `-Dnalim.noinline=true` can produce
+`Optional.empty()`. Use the actual C ABI type and keep the library loaded and
+its text unchanged. `findIntrinsic` neither installs a native method nor
+silently substitutes a slower handle.
 
 Inlining decisions can be inspected with `-Dnalim.trace.inline=true`.
 `-Dnalim.noinline=true` and `-Dnalim.nodirect=true` force the fallback paths
@@ -348,6 +398,65 @@ inline versus the forced stub path on JDK 25:
 Straight-line integer mixers (`splitmix`) show ≤2% — the tail jump overlaps
 their multiply chain, so widening inline coverage matters most for short,
 low-latency bodies.
+
+`test/bench-link-paths.py` compares two jars using the same native libraries
+and Java call sites, alternating their order over eight JVM pairs on one CPU:
+
+```sh
+JAVA_HOME=/path/to/jdk-25 python3 test/bench-link-paths.py /path/to/baseline.jar ./nalim.jar --cpu 2
+# Include data-dependent integer loops, dependent heap loads, @Code binding,
+# native symbol hits/misses and standalone Win64 frame generation:
+JAVA_HOME=/path/to/jdk-25 python3 test/bench-link-paths.py /path/to/baseline.jar ./nalim.jar \
+    --cpu 2 --pairs 8 --workload leaves paths code win-emit symbols
+```
+
+Native-call loops check their checksums; the `@Code` workload invokes each
+installed body outside the timed interval. The Win64 workload consumes a CRC
+of the generated code and measures emission, not execution on Windows. The
+first-class timer starts **after** JVMCI initialization and library loading.
+The warmed linking tests bind fresh classes, excluding class definition;
+allocations are Java heap bytes on the linking thread, not code-cache space.
+
+Linux x86-64, Ryzen AI 9 365, OpenJDK 25.0.5.0.3, G1; median of eight JVMs
+per jar. The baseline already used **direct** jumps/calls for both wrappers.
+
+| Measurement | `d367a5e` | First optimization pass |
+| --- | ---: | ---: |
+| Already-inlined `raw_add(i, 17)` (ns/call, control) | 2.519 | 2.517 |
+| Forwarding entry with a RIP-relative literal (ns/call) | 2.529 | 2.014 |
+| Branched `byte` classifier with two returns (ns/call) | 4.546 | 2.646 |
+| First three-method class (ms) | 81.15 | 73.62 |
+| Subsequent fresh classes (µs/method) | 16.65 | 15.38 |
+| Linking-thread heap allocation (bytes/method) | 5,806 | 2,886 |
+
+The next comparison uses the **first-pass jar** (`784784c9`), not `d367a5e`,
+as the baseline. In `BenchLeafCalls`, the same `invokeExact` call sites use
+handles to the linked native methods before, and verified Java equivalents
+after. Each loop consumes changing integers and checks its sum. Nanoseconds
+per element measure loop throughput, not the latency of an isolated FFI
+call. Symbol lookup and intrinsic setup are outside these loops.
+
+| Measurement | First-pass jar | Current jar (`edbeb0ee`) |
+| --- | ---: | ---: |
+| `raw_add` via static-final handle (ns/element) | 2.5287 | 0.1515 |
+| `raw_abs` via static-final handle (ns/element) | 2.0216 | 0.1535 |
+| Ordinary `@Link raw_add` (ns/element) | 2.5257 | 2.5317 |
+| Ordinary `@Link raw_abs` (ns/element) | 2.0250 | 2.0225 |
+| Dependent `long[]` loads via `@Link` (ns/element) | 5.0596 | 4.5495 |
+| First three-method `@Link` class (ms) | 73.38 | 61.36 |
+| Subsequent fresh three-method `@Link` classes (µs/method) | 15.21 | 15.70 |
+| `@Code` binding (µs/method) | 22.34 | 20.61 |
+| `@Code` binding (heap bytes/method) | 4,105 | 2,743 |
+| Win64 adapter emission (ns/frame) | 123.06 | 66.32 |
+| Win64 adapter emission (heap bytes/frame) | 369 | 0 |
+
+Both handle targets were reported as `inline (hot)` in the JDK 21 and 25 JIT
+logs. The large arithmetic gains are not present at ordinary native call
+sites. Standalone symbol lookup also showed no allocation reduction: zero
+heap bytes on both jars, about 143 vs 142 ns for a hit and 1.270 vs 1.346 µs
+for a miss. Win64 frame execution was checked separately with GCC `ms_abi`
+callees on Linux, including shadow-space writes and mixed register/stack
+arguments; no Windows JVM timing is implied.
 
 Memory-path reference numbers from `BenchMemAccess` (sum of *n* longs, one
 Nalim call into an AVX2-built kernel vs a C2-compiled Java loop vs Panama

@@ -60,6 +60,11 @@ public class InlineFixturesTest {
     }
 
     static class Asm {
+        @Link static native int fxa_forward(int x);
+        @Link static native int fxa_forward_chain(int x);
+        @Link static native int fxa_forward_page(int x);
+        @Link static native short fxa_literal_word(int x);
+        @Link static native byte fxa_classify8(int x);
         @Link static native long fxa_jmp_fwd(long x);
         @Link static native long fxa_loop_back(long n);
         @Link static native long fxa_rep_stos(long[] p, long n, long v);
@@ -89,6 +94,16 @@ public class InlineFixturesTest {
         @Link static native long fxa_cmov_set(long x, long y);
         @Link static native long fxa_endbr64(long x);
         @Link static native long fxa_endbr32(long x);
+    }
+
+    static class Edges {
+        @Link static native byte fxb_rel8_limit(int x);
+        @Link static native short fxb_word(int x);
+        @Link static native short fxb_word_control();
+        @Link static native void fxb_set_word(int value);
+        @Link static native int fxb_indirect(int x);
+        @Link static native void fxb_switch();
+        @Link static native int fxb_long_chain(int x);
     }
 
     // ── link + inline coverage report ──────────────────────────────────
@@ -204,6 +219,32 @@ public class InlineFixturesTest {
         }
 
         SplittableRandom rnd = new SplittableRandom(42);
+        for (int x : new int[] { Integer.MIN_VALUE, -1, 0, 1, Integer.MAX_VALUE }) {
+            eq(Asm.fxa_forward(x), x + 17, "forwarded RIP-relative leaf");
+            eq(Asm.fxa_forward_chain(x), x + 17, "chained entry thunks");
+            eq(Asm.fxa_forward_page(x), x + 5, "forwarded leaf across readable pages");
+            eq(Asm.fxa_literal_word(x), x == 0 ? (short) 0x9980 : -32768, "rel32 edges with relocated literal");
+            eq(Asm.fxa_classify8(x), x < 0 ? -128 : x == 0 ? 0 : 1, "narrow branch exit");
+        }
+        linkAll(Edges.class);
+        for (int x : new int[] { -1, 0, 1, 2 }) {
+            eq(Edges.fxb_rel8_limit(x), x < 0 ? 98 : x == 0 ? 0 : x == 1 ? -128 : 127, "rel8 limit");
+        }
+        eq(Edges.fxb_word(1), -32768, "rel32 fallthrough");
+        eq(Edges.fxb_word(0), 0x7abc, "mutable RIP load");
+        eq(Edges.fxb_word_control(), 0x7abc, "native rebase reachability control");
+        if (inlineStatus.get("fxb_word_control") && !inlineStatus.get("fxb_word")) {
+            throw new AssertionError("reachable live RIP operand dropped the rel32 leaf to the bridge");
+        }
+        Edges.fxb_set_word(0xcafe8003);
+        eq(Edges.fxb_word(0), -32765, "relocated load after native write");
+        eq(Edges.fxb_indirect(25), 42, "indirect entry before update");
+        Edges.fxb_switch();
+        eq(Edges.fxb_indirect(25), 8, "indirect entry after update");
+        eq(Edges.fxb_long_chain(41), 42, "bounded thunk-chain fallback");
+        for (String symbol : new String[] { "fxb_rel8_limit", "fxb_indirect", "fxb_long_chain" }) {
+            if (inlineStatus.get(symbol)) throw new AssertionError("expected fallback: " + symbol);
+        }
 
         // ── C fixtures, both builds ─────────────────────────────────────
         int[] ns = {0, 1, 2, 3, 7, 100, 1000, -5};

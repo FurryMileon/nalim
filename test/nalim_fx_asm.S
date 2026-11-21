@@ -14,6 +14,32 @@
     .p2align 4;         \
 name:
 
+// An exported tail wrapper, as emitted for a hidden implementation in a DSO.
+// The destination is deliberately outside the normal 128-byte decode window.
+FUNC(fxa_forward)
+.Lforward:
+    endbr64
+    jmp .Lforward_impl
+
+FUNC(fxa_forward_chain)
+    jmp .Lforward
+
+// Three paths, two exits, with ABI-legal dirty upper bits. Also exercises
+// a RIP load after the first ret and a backwards branch to that ret.
+FUNC(fxa_classify8)
+    test edi, edi
+    js .Lnegative
+    je .Lzero
+    mov eax, 0x77889901
+.Lpositive_ret:
+    ret
+.Lnegative:
+    mov eax, dword ptr [rip + .Ldirty_negative]
+    rep ret
+.Lzero:
+    mov eax, 0x77889900
+    jmp .Lpositive_ret
+
 // jmp rel8 forward over a garbage hole (never executed, still copied).
 FUNC(fxa_jmp_fwd)               // (rdi: long) -> long = rdi+1 via detour
     jmp 1f
@@ -255,7 +281,94 @@ FUNC(fxa_endbr32)               // (rdi) -> rdi+32
     lea rax, [rdi+32]
     ret
 
+// Inserting three normalizers would overflow the short jump to .Lfar_zero.
+// The native version still handles all four cases; use it unchanged.
+FUNC(fxb_rel8_limit)
+    test edi, edi
+    jz .Lfar_zero
+    cmp edi, 1
+    je .Lone
+    jl .Lless
+    mov eax, 0x7788997f
+    ret
+.Lone:
+    mov eax, 0x77889980
+    ret
+.Lless:
+    mov eax, 0x77889962
+    ret
+    .fill 125 - (. - fxb_rel8_limit), 1, 0xcc
+.Lfar_zero:
+    xor eax, eax
+    ret
+
+// Force rel32 edges over a non-terminal return. Only the operand differs:
+// the read-only version always inlines, the live one needs rel32 reach.
+    .macro word_exit source
+    test edi, edi
+    .byte 0x0f, 0x84
+    .long 2f - . - 4
+    mov eax, 0xcafe8000
+1:
+    rep ret
+2:  mov eax, dword ptr [rip + \source]
+    .byte 0xe9
+    .long 1b - . - 4
+    .endm
+FUNC(fxa_literal_word)
+    word_exit .Ldirty_negative
+FUNC(fxb_word)
+    word_exit .Lword
+FUNC(fxb_word_control)
+    mov eax, dword ptr [rip + .Lword]
+    ret
+
+FUNC(fxb_set_word)
+    mov dword ptr [rip + .Lword], edi
+    ret
+
+// An indirect entry must keep consulting its dispatch slot.
+FUNC(fxb_indirect)
+    jmp qword ptr [rip + .Ldispatch]
+FUNC(fxb_switch)
+    lea rax, [rip + .Lsubtract]
+    mov qword ptr [rip + .Ldispatch], rax
+    ret
+.Lsubtract:
+    lea eax, [rdi - 17]
+    ret
+
+.Lhop0: lea eax, [rdi + 1]
+    ret
+.Lhop1: jmp .Lhop0
+.Lhop2: jmp .Lhop1
+.Lhop3: jmp .Lhop2
+.Lhop4: jmp .Lhop3
+FUNC(fxb_long_chain)
+    jmp .Lhop4
+
+.Lforward_impl:
+    mov eax, dword ptr [rip + .Ldelta]
+    add eax, edi
+    ret
+
+// The first instruction of a valid leaf straddles two readable text pages.
+FUNC(fxa_forward_page)
+    jmp .Lpage_leaf
+    .p2align 12
+    .space 4094
+.Lpage_leaf:
+    lea eax, [rdi + 5]
+    ret
+
+    .data
+    .p2align 3
+.Ldispatch: .quad .Lforward_impl
+.Lword:     .long 0x7abc
+
     .section .rodata
+.Ldirty_negative: .long 0x77889980
+.Ldelta:          .long 17
     .p2align 5
 .LK32:
     .quad 0x1111111111111111, 0x2222222222222222, 0x3333333333333333, 0x4444444444444444

@@ -4,9 +4,8 @@
 //     ints: rdx, r8, r9, rdi, rsi, rcx, then stack ([rsp+8+8k] at entry)
 //       fp: xmm0-xmm7, then stack
 // Its OUTPUT is a Win64 native call, which GCC can receive natively via
-// __attribute__((ms_abi)). Each callee has a System-V twin with the same
-// body; the harness computes the expected value by feeding the twin the
-// same argument values the Java convention would have delivered.
+// __attribute__((ms_abi)). Compare against System-V twins or the individual
+// source values, including the actual field displacement from the probe VM.
 //
 // Build: gcc -O1 -o win_abi_harness win_abi_harness.c
 // Run:   ./win_abi_harness   (in the directory with win_adapter_*.bin)
@@ -21,7 +20,9 @@
 #define MAGIC 0xDEADBEEFCAFEBABEULL
 
 // Distinct, easily-traced argument values.
-static const uint32_t INT_REGS[6] = {101, 102, 103, 104, 105, 106};
+const uint64_t INT_REGS[6] = {
+    0x100000065, 0x200000066, 0x300000067, 0x400000068, 0x500000069, 0x60000006a
+};
 // xmm0-7 raw: low 32 = float(10.5+i), high 32 = float(20.5+i) -> valid doubles.
 uint64_t XMM_RAW[8];
 // 4 shared Java stack slots.
@@ -60,14 +61,44 @@ TWIN(double,  d6,   (double a, double b, double c, double e, double g, double h)
 TWIN(double,  d11,  (double a, double b, double c, double e, double g, double h,
                      double j, double k, double m, double n, double o),
                     { return BODY_D11(a, b, c, e, g, h, j, k, m, n, o); })
-TWIN(int64_t, l7,   (int64_t a, int64_t b, int64_t c, int64_t e, int64_t g, int64_t h, int64_t j),
+TWIN(uint64_t, l7,  (uint64_t a, uint64_t b, uint64_t c, uint64_t e, uint64_t g, uint64_t h, uint64_t j),
                     { return BODY_L7(a, b, c, e, g, h, j); })
 TWIN(double,  mixed10, (int32_t a, double b, int64_t c, double e, int32_t g,
                         double h, int64_t j, double k, int32_t m, double n),
                     { return BODY_MIXED10(a, b, c, e, g, h, j, k, m, n); })
 TWIN(double,  if4,  (int32_t a, float b, float c, float e, float g), { return BODY_IF4(a, b, c, e, g); })
 
+static uint64_t __attribute__((ms_abi)) ms_ffll(float a, float b, uint64_t c, uint64_t d) {
+    return a == as_f32(XMM_RAW[0]) && b == as_f32(XMM_RAW[1])
+        && c == INT_REGS[0] && d == INT_REGS[1];
+}
+
+static unsigned field_offset;
+
+static uint64_t __attribute__((ms_abi)) ms_fields(
+        uint64_t a, float b, uint64_t c, uint64_t d, uint64_t e, double f, uint64_t g, double h,
+        float i, double j, float k, double l, uint64_t m, uint64_t n, float o, uint64_t p,
+        double q, float r) {
+    return a == INT_REGS[0] && b == as_f32(XMM_RAW[0]) && c == INT_REGS[1] + field_offset
+        && d == INT_REGS[2] && e == INT_REGS[3] + field_offset && f == as_f64(XMM_RAW[1])
+        && g == INT_REGS[4] && h == as_f64(XMM_RAW[2]) && i == as_f32(XMM_RAW[3])
+        && j == as_f64(XMM_RAW[4]) && k == as_f32(XMM_RAW[5]) && l == as_f64(XMM_RAW[6])
+        && m == INT_REGS[5] && n == SLOT_RAW[0] + field_offset && o == as_f32(XMM_RAW[7])
+        && p == SLOT_RAW[1] + field_offset && q == as_f64(SLOT_RAW[2]) && r == as_f32(SLOT_RAW[3]);
+}
+
 // ── trampoline: load HotSpot-Java-Windows-convention state, call adapter ──
+
+extern uint64_t __attribute__((ms_abi)) ms_shadow(void);
+__asm__(
+    ".text\n"
+    ".type ms_shadow, @function\n"
+    "ms_shadow:\n\t"
+    "movaps %xmm0, 8(%rsp)\n\t"    // must be aligned and owned by the callee
+    "movaps %xmm1, 24(%rsp)\n\t"
+    "mov $1, %eax\n\t"
+    "ret\n"
+);
 double ret_xmm0;
 
 extern uint64_t run_adapter(void *code);
@@ -94,12 +125,13 @@ __asm__(
     "movsd 40(%rax), %xmm5\n\t"
     "movsd 48(%rax), %xmm6\n\t"
     "movsd 56(%rax), %xmm7\n\t"
-    "mov  $101, %edx\n\t"
-    "mov  $102, %r8d\n\t"
-    "mov  $103, %r9d\n\t"
-    "mov  $104, %edi\n\t"
-    "mov  $105, %esi\n\t"
-    "mov  $106, %ecx\n\t"
+    "lea  INT_REGS(%rip), %rax\n\t"
+    "mov   0(%rax), %rdx\n\t"
+    "mov   8(%rax), %r8\n\t"
+    "mov  16(%rax), %r9\n\t"
+    "mov  24(%rax), %rdi\n\t"
+    "mov  32(%rax), %rsi\n\t"
+    "mov  40(%rax), %rcx\n\t"
     "call *%r10\n\t"               // adapter entry: rsp%16==8, slots at [rsp+8+8k]
     "add  $48, %rsp\n\t"
     "movsd %xmm0, ret_xmm0(%rip)\n\t"
@@ -116,7 +148,6 @@ static ArgVals java_map(const char *sig) {
     for (const char *c = sig; *c; c++, v.n++) {
         if (*c == 'f' || *c == 'd') {
             v.raw[v.n] = (fi < 8) ? XMM_RAW[fi++] : SLOT_RAW[sp++];
-            if (fi > 8 && v.raw[v.n] == XMM_RAW[7]) {} // no-op
         } else {
             v.raw[v.n] = (ii < 6) ? (uint64_t) INT_REGS[ii++] : SLOT_RAW[sp++];
         }
@@ -172,8 +203,9 @@ int main(void) {
         XMM_RAW[i] = (uint64_t) lb | ((uint64_t) hb << 32);
     }
     for (int i = 0; i < 4; i++) {
-        double v = 201.5 + i;
-        memcpy(&SLOT_RAW[i], &v, 8);
+        float lo = 201.5f + i, hi = 211.5f + i;
+        uint32_t lb, hb; memcpy(&lb, &lo, 4); memcpy(&hb, &hi, 4);
+        SLOT_RAW[i] = (uint64_t) lb | ((uint64_t) hb << 32);
     }
 
     ArgVals v;
@@ -221,9 +253,8 @@ int main(void) {
 
     v = java_map("lllllll");
     r = run_adapter(load_adapter("l7", (void *) ms_l7));
-    check_l("l7", (int64_t) r,
-            sysv_l7((int64_t) v.raw[0], (int64_t) v.raw[1], (int64_t) v.raw[2], (int64_t) v.raw[3],
-                    (int64_t) v.raw[4], (int64_t) v.raw[5], (int64_t) v.raw[6]));
+    check_l("l7", (int64_t) r, (int64_t) sysv_l7(v.raw[0], v.raw[1], v.raw[2], v.raw[3],
+                                                 v.raw[4], v.raw[5], v.raw[6]));
 
     v = java_map("idldidldid");
     run_adapter(load_adapter("mixed10", (void *) ms_mixed10));
@@ -236,6 +267,16 @@ int main(void) {
     run_adapter(load_adapter("if4", (void *) ms_if4));
     check_d("if4", ret_xmm0,
             sysv_if4((int32_t) v.raw[0], as_f32(v.raw[1]), as_f32(v.raw[2]), as_f32(v.raw[3]), as_f32(v.raw[4])));
+
+    check_l("shadow", run_adapter(load_adapter("shadow", (void *) ms_shadow)), 1);
+    check_l("ffll", run_adapter(load_adapter("ffll", (void *) ms_ffll)), 1);
+    FILE *offsets = fopen("win_field_offset.txt", "r");
+    if (!offsets || fscanf(offsets, "%u", &field_offset) != 1 || !field_offset) {
+        fprintf(stderr, "Missing or invalid win_field_offset.txt\n");
+        return 1;
+    }
+    fclose(offsets);
+    check_l("fields", run_adapter(load_adapter("fields", (void *) ms_fields)), 1);
 
     printf(failures ? "=== %d FAILURES ===\n" : "=== ALL WIN64 ADAPTERS MATCH ===\n", failures);
     return failures != 0;

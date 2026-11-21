@@ -36,15 +36,18 @@ import jdk.vm.ci.runtime.JVMCI;
 import jdk.vm.ci.runtime.JVMCIBackend;
 import jdk.vm.ci.runtime.JVMCICompiler;
 
+import java.lang.annotation.Annotation;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -66,6 +69,7 @@ public class Linker {
     private static final CallingConvention callingConvention = CallingConvention.getInstance();
     private static final String ARCH = System.getProperty("os.arch", "");
     private static final boolean AMD64 = ARCH.equalsIgnoreCase("amd64") || ARCH.equalsIgnoreCase("x86_64");
+    private static final boolean SYSV_AMD64 = AMD64 && "Linux".equals(System.getProperty("os.name"));
 
     // JDK 21+ requires every installed nmethod to carry an entry barrier
     // (Loom / JEP 444 made BarrierSetNMethod mandatory for every GC). The
@@ -127,7 +131,7 @@ public class Linker {
                 } else {
                     System.loadLibrary(name);
                 }
-                readOnlyRanges = null;   // new mappings appeared — re-read /proc/self/maps
+                NativeMappings.invalidate();
             } catch (RuntimeException | Error t) {
                 // A failed first attempt must not poison the deduplication map;
                 // callers may fix java.library.path / extract the binary and retry.
@@ -137,39 +141,33 @@ public class Linker {
         }
     }
 
-    // ClassLoader.findNative signature evolved across JDK versions:
-    //   JDK ≤ 21:  static long findNative(ClassLoader, String)
-    //   JDK ≥ 22:  static long findNative(ClassLoader, Class<?>, String, String)
-    // We resolve once at class init, then dispatch on parameter count.
-    private static final Method FIND_NATIVE = resolveFindNative();
-
-    private static Method resolveFindNative() {
-        try {
-            return JavaInternals.getPrivateMethod(ClassLoader.class, "findNative",
-                    ClassLoader.class, Class.class, String.class, String.class);
-        } catch (RuntimeException e1) {
-            try {
-                return JavaInternals.getPrivateMethod(ClassLoader.class, "findNative",
-                        ClassLoader.class, String.class);
-            } catch (RuntimeException e2) {
-                throw new IllegalStateException("Cannot resolve ClassLoader.findNative", e2);
-            }
-        }
+    public static long findAddress(String symbol) {
+        return NativeSymbols.find(symbol);
     }
 
-    public static long findAddress(String symbol) {
-        ClassLoader cl = Linker.class.getClassLoader();
-        try {
-            if (FIND_NATIVE.getParameterCount() == 4) {
-                // JDK 22+: (loader, caller, entryName, javaName).
-                // entryName is the symbol passed to dlsym; javaName is for diagnostics.
-                return (long) FIND_NATIVE.invoke(null, cl, Linker.class, symbol, symbol);
-            } else {
-                return (long) FIND_NATIVE.invoke(null, cl, symbol);
-            }
-        } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException(e);
-        }
+    /**
+     * Find an exact Java equivalent for a pure integer function in a loaded
+     * Linux AMD64 library. A static-final handle can inline into the Java
+     * caller, unlike an installed native nmethod. The type must describe the
+     * real C function. Missing symbols, unrecognized bodies, or failure to
+     * read the non-writable executable text via procfs produce an empty result.
+     * This does not install or rebind a Java method. The returned operation
+     * represents the inspected code; the library must keep that text stable.
+     */
+    public static Optional<MethodHandle> findIntrinsic(String symbol, MethodType type) {
+        Objects.requireNonNull(symbol, "symbol");
+        Objects.requireNonNull(type, "type");
+        if (!SYSV_AMD64 || NO_INLINE) return Optional.empty();
+        Class<?> result = type.returnType();
+        int n = type.parameterCount();
+        if ((result != int.class && result != long.class) || (n != 1 && n != 2)) return Optional.empty();
+        for (int i = 0; i < n; i++) if (type.parameterType(i) != result) return Optional.empty();
+        long address = findAddress(symbol);
+        if (address == 0) return Optional.empty();
+        byte[] code = NativeMappings.readExecutablePrefix(address, AMD64ScalarLeaf.MAX_PREFIX_BYTES);
+        if (code == null) return Optional.empty();
+        AMD64ScalarLeaf leaf = AMD64ScalarLeaf.matchWord(code, code.length, result, n);
+        return leaf == null ? Optional.empty() : Optional.of(leaf.handle());
     }
 
     public static void linkClass(Class<?> c) {
@@ -178,19 +176,24 @@ public class Linker {
             loadLibrary(library.value());
         }
 
+        InlineScratch scratch = null;
         for (Method m : c.getDeclaredMethods()) {
-            if (m.getAnnotation(Link.class) != null || m.getAnnotation(Code.class) != null) {
-                linkMethod(m);
+            Code code = m.getAnnotation(Code.class);
+            if (code != null) {
+                installHexCode(m, code.value());
+            } else {
+                Link link = m.getAnnotation(Link.class);
+                if (link != null) {
+                    scratch = linkNative(m, link.name(), link.naked(), scratch);
+                }
             }
         }
     }
 
     public static void linkMethod(Method m) {
-        checkMethodType(m);
-
         Code code = m.getAnnotation(Code.class);
         if (code != null) {
-            installCode(m, parseHex(code.value()));
+            installHexCode(m, code.value());
             return;
         }
 
@@ -203,6 +206,12 @@ public class Linker {
     }
 
     public static void linkMethod(Method m, String symbol, boolean naked) {
+        linkNative(m, symbol, naked, null);
+    }
+
+    // Return the workspace for the next method in this class. A framed or
+    // no-inline binding never allocates one just to pass it on.
+    private static InlineScratch linkNative(Method m, String symbol, boolean naked, InlineScratch scratch) {
         checkMethodType(m);
 
         Library library = m.getAnnotation(Library.class);
@@ -218,50 +227,60 @@ public class Linker {
             throw new IllegalArgumentException("Symbol not found: " + symbol);
         }
 
-        // Worst case: shuffle (<=24B) + body (<=128B) + eight aligned 16B
-        // SIMD literals (<=248B incl. padding) + entry barrier (<=12B); framed
-        // adapters add a prologue plus ~18B per native stack argument.
-        ByteBuffer buf = ByteBuffer.allocate(1024).order(ByteOrder.nativeOrder());
+        Class<?>[] types = m.getParameterTypes();
+        boolean framed = !naked && callingConvention.requiresFramedCall(types);
+        Class<?> returnType = m.getReturnType();
+        boolean pendingScalarShuffle = SYSV_AMD64 && !naked && !framed && !NO_INLINE
+                && AMD64ScalarLeaf.accepts(returnType, types);
+        // 128 bytes covers the entry barrier, six disp32 LEAs and the largest
+        // frameless fallback. Reserve Win64 stack marshalling separately: up to
+        // 8 bytes to load a spill, 7 for a field LEA, 8 for the outgoing store.
+        int capacity = framed ? 160 + 24 * Math.max(0, types.length - 4) : 128;
+        ByteBuffer buf = ByteBuffer.allocate(capacity).order(ByteOrder.nativeOrder());
         EntryBarrier entryBarrier = emitEntryBarrierPrologue(buf);
+        int shuffleStart = buf.position();
 
-        // Argument shuffle first. Skipped for naked=true (the target function is
-        // authored directly in HotSpot's Java register convention) and for
-        // framed calls, whose prologue does the full marshalling itself —
-        // native stack stores must run before the register shuffle.
-        boolean framed = !naked && callingConvention.requiresFramedCall(m.getParameterTypes());
-        if (!naked && !framed) {
-            callingConvention.javaToNative(buf, m.getParameterTypes(), m.getParameterAnnotations());
+        // Scalar templates already consume Java registers. Don't generate an
+        // unused shuffle for them. A miss restores the regular shuffle before
+        // either the general inliner or the fallback sees the buffer.
+        Annotation[][] annotations = null;
+        if (!naked && !pendingScalarShuffle) {
+            // All calling conventions consult annotations only for reference arguments.
+            for (Class<?> type : types) {
+                if (!type.isPrimitive()) {
+                    annotations = m.getParameterAnnotations();
+                    break;
+                }
+            }
+            if (!framed) callingConvention.javaToNative(buf, types, annotations);
         }
 
-        // Auto-inline: if the target is a small leaf made of whitelisted opcodes
-        // and a verified forward-only Jcc graph whose paths end in `ret`, copy
-        // its body straight into the nmethod after the shuffle. RIP-relative loads from read-only pages
-        // (compiler constant literals) are relocated into a literal pool emitted
-        // after the body. This removes the `mov rax, addr; jmp rax` indirection
-        // and saves ~0.2 ns per call (measured: 1.20 ns -> 1.00 ns on
-        // AMD @ 5.96 GHz, JDK 25). On reg-reg-mov-eliminating cores the shuffle
-        // movs are free, so plain extern "C" functions inline as well as naked
-        // Java-ABI ones. Anything unrecognised falls back to the tail-call stub.
-        Class<?> returnType = m.getReturnType();
-        boolean normalizeReturn = CallingConvention.needsReturnNormalization(returnType);
+        // Only the copied body may use a resolved entry thunk. A rejected leaf
+        // must still call the original symbol with its original calling convention.
         Call directJump = null;
-        List<long[]> rebases = new ArrayList<>();
         if (framed) {
             // Framed adapter (Win64): the callee owns shadow space and stack
             // args live in the caller frame, so tail jumps and auto-inline of
             // foreign-ABI bodies are unsafe. Return normalization is folded
             // into the frame epilogue.
-            directJump = tryEmitDirectFramedCall(buf, address, m);
+            directJump = tryEmitDirectFramedCall(buf, address, returnType, types, annotations);
             if (directJump == null) {
-                callingConvention.emitFramedCall(buf, address, returnType,
-                        m.getParameterTypes(), m.getParameterAnnotations());
+                callingConvention.emitFramedCall(buf, address, returnType, types, annotations);
             }
-        } else if (!tryInlineSmallFunction(buf, address, symbol, returnType, rebases)) {
-            if (normalizeReturn) {
-                directJump = tryEmitDirectNarrowCall(buf, address, returnType, m.getParameterTypes());
+        } else {
+            if (AMD64 && !NO_INLINE) {
+                if (scratch == null) scratch = new InlineScratch();
+                ByteBuffer inline = tryInlineSmallFunction(buf, address, symbol, returnType, scratch,
+                        !naked && SYSV_AMD64 ? shuffleStart : -1, types, pendingScalarShuffle);
+                if (inline != null) {
+                    installCode(m, inline, null, entryBarrier, scratch.rebases);
+                    return scratch;
+                }
+            }
+            if (CallingConvention.needsReturnNormalization(returnType)) {
+                directJump = tryEmitDirectNarrowCall(buf, address, returnType, types);
                 if (directJump == null) {
-                    callingConvention.emitCallAndNormalize(
-                            buf, address, returnType, m.getParameterTypes());
+                    callingConvention.emitCallAndNormalize(buf, address, returnType, types);
                 }
             } else {
                 directJump = tryEmitDirectJump(buf, address);
@@ -271,7 +290,8 @@ public class Linker {
             }
         }
 
-        installCode(m, buf, directJump, entryBarrier, rebases);
+        installCode(m, buf, directJump, entryBarrier, null);
+        return scratch;
     }
 
     // The old AMD64 fallback is `movabs rax, address; jmp rax` (12 bytes and
@@ -307,7 +327,8 @@ public class Linker {
 
     // Framed-call variant of the direct-call optimization: same reachability
     // gate, but the frame prologue/epilogue wrap the JVMCI-bound call rel32.
-    private static Call tryEmitDirectFramedCall(ByteBuffer buf, long address, Method m) {
+    private static Call tryEmitDirectFramedCall(ByteBuffer buf, long address, Class<?> returnType,
+                                                Class<?>[] types, Annotation[][] annotations) {
         if (NO_DIRECT_JUMP || !AMD64) {
             return null;
         }
@@ -316,7 +337,7 @@ public class Linker {
             return null;
         }
         int pcOffset = callingConvention.emitDirectFramedCall(
-                buf, m.getReturnType(), m.getParameterTypes(), m.getParameterAnnotations());
+                buf, returnType, types, annotations);
         if (pcOffset < 0) {
             return null;
         }
@@ -378,41 +399,83 @@ public class Linker {
         return inlinedMethods;
     }
 
-    private static boolean tryInlineSmallFunction(
+    // Owned by one linkClass invocation, never by a thread-local or a global cache.
+    // Entries in lengths: 0 = unseen, QUEUED = block start, INTERIOR = not a target,
+    // positive = verified instruction length. Only symbols with RIP operands need fixups.
+    private static final byte QUEUED = -2, INTERIOR = -1;
+    private static final class InlineScratch {
+        final byte[] code = new byte[MAX_INLINE_BYTES];
+        final byte[] lengths = new byte[MAX_INLINE_BYTES];
+        final byte[] queue = new byte[MAX_INLINE_BYTES];
+        final Insn insn = new Insn();
+        Fixups literals;
+        Fixups rebases;
+    }
+
+    private static final class Fixups {
+        final long[] target = new long[MAX_RELOCATIONS];
+        final int[] disp = new int[MAX_RELOCATIONS];
+        final int[] next = new int[MAX_RELOCATIONS];
+        final int[] size = new int[MAX_RELOCATIONS];
+        int count;
+
+        void add(long address, int field, int after, int width) {
+            target[count] = address;
+            disp[count] = field;
+            next[count] = after;
+            size[count++] = width;
+        }
+
+        void place(int start, int[] offsets) {
+            for (int r = 0; r < count; r++) {
+                disp[r] = start + (offsets == null ? disp[r] : offsets[disp[r]]);
+                next[r] = start + (offsets == null ? next[r] : offsets[next[r]]);
+            }
+        }
+    }
+
+    private static ByteBuffer tryInlineSmallFunction(
             ByteBuffer buf, long address, String symbol, Class<?> returnType,
-            List<long[]> rebaseOut) {
-        if (NO_INLINE) {
-            return false;
+            InlineScratch scratch, int shuffleStart, Class<?>[] types, boolean pendingScalarShuffle) {
+        address = NativeMappings.copyEntry(address, scratch.code);
+        if (address == 0) {
+            if (pendingScalarShuffle) callingConvention.javaToNative(buf, types, null);
+            return null; // caller still has the original symbol for the native fallback
         }
-        if (!AMD64) {
-            return false;
+        int window = NativeMappings.pageWindow(address, MAX_INLINE_BYTES);
+        if (shuffleStart >= 0) {
+            AMD64ScalarLeaf leaf = null;
+            if (pendingScalarShuffle) {
+                leaf = AMD64ScalarLeaf.matchWord(scratch.code, window, returnType, types.length);
+                if (leaf != null) leaf.emitJavaBody(buf);
+                else callingConvention.javaToNative(buf, types, null); // exact primitive signature
+            }
+            if (leaf != null || AMD64MemoryLeaf.tryEmit(buf, shuffleStart, scratch.code, window, returnType, types)) {
+                // Unlike the general CFG path, this body has no relocations.
+                if (scratch.rebases != null) scratch.rebases.count = 0;
+                inlinedMethods++;
+                if (TRACE_INLINE) System.out.printf("[nalim] %s: inlined %dB Java-ABI leaf%n", symbol, buf.position() - shuffleStart);
+                return buf;
+            }
         }
+        ByteBuffer inline = tryInlineWindow(buf, address, symbol, returnType, scratch, window);
+        if (inline != null || window == MAX_INLINE_BYTES) return inline;
 
-        // Read only inside the executable/read-only mapping that contains the
-        // symbol. This permits a small function to cross a page boundary (a
-        // common linker placement) without ever probing an unmapped page. If
-        // /proc/self/maps is unavailable, retain the conservative single-page
-        // fallback.
-        int window = mappedReadWindow(address, MAX_INLINE_BYTES);
+        int expanded = NativeMappings.extendCodeWindow(address, scratch.code, window);
+        if (expanded <= window) return null;
+        return tryInlineWindow(buf, address, symbol, returnType, scratch, expanded);
+    }
 
-        byte[] code = new byte[window];
-        for (int i = 0; i < window; i++) {
-            code[i] = NativeMemory.unsafe.getByte(address + i);
-        }
+    private static ByteBuffer tryInlineWindow(ByteBuffer buf, long address, String symbol,
+                                              Class<?> returnType, InlineScratch scratch, int window) {
+        byte[] code = scratch.code;
 
         // ── pass 1: decode and validate ─────────────────────────────────
-        Insn insn = new Insn();
-        long[] litSrc  = new long[MAX_RELOCATIONS];  // literal source address
-        int[]  litOff  = new int[MAX_RELOCATIONS];   // disp32 field offset within body
-        int[]  litNext = new int[MAX_RELOCATIONS];   // offset of next instruction (RIP base)
-        int[]  litSize = new int[MAX_RELOCATIONS];   // literal byte size (1/2/4/8/16)
-        int relocs = 0;
-        long[] rebTarget = new long[MAX_RELOCATIONS]; // original operand address
-        int[]  rebOff    = new int[MAX_RELOCATIONS];  // disp32 field offset within body
-        int[]  rebNext   = new int[MAX_RELOCATIONS];  // offset of next instruction (RIP base)
-        int rebases = 0;
+        Insn insn = scratch.insn;
+        Fixups literals = scratch.literals, rebases = scratch.rebases;
+        if (literals != null) literals.count = 0;
+        if (rebases != null) rebases.count = 0;
         int end = 0;
-        boolean sawRet = false;
         int retCount = 0;
         int terminalRetOffset = -1;
         int terminalRetLength = 0;
@@ -423,24 +486,20 @@ public class Linker {
         // must land on a verified instruction boundary inside the window — a
         // branch into the middle of an instruction is rejected either here (the
         // target is already owned by another offset) or when the target block
-        // decodes and collides with owned bytes. Keeping the copy contiguous
-        // preserves every internal displacement without rewriting.
-        int[] owner = new int[window];
-        int[] decodedLen = new int[window];
-        int[] queue = new int[window];
-        boolean[] queued = new boolean[window];
-        Arrays.fill(owner, -1);
+        // decodes and collides with owned bytes.
+        byte[] lengths = scratch.lengths, queue = scratch.queue;
+        Arrays.fill(lengths, 0, window, (byte) 0);
         int head = 0;
         int tail = 0;
         queue[tail++] = 0;
-        queued[0] = true;
+        lengths[0] = QUEUED;
 
         while (head < tail) {
-            int i = queue[head++];
+            int i = queue[head++] & 0xff;
             for (;;) {
-                if (i < 0 || i >= window) return false;
-                if (decodedLen[i] != 0) break;       // merges into a verified block
-                if (owner[i] != -1) return false;    // branch into instruction middle
+                if (i >= window) return null;
+                if (lengths[i] > 0) break;            // merges into a verified block
+                if (lengths[i] == INTERIOR) return null;
 
                 int b = code[i] & 0xFF;
                 int length;
@@ -451,14 +510,12 @@ public class Linker {
 
                 if (b == 0xC3) {
                     length = 1;
-                    sawRet = true;
                     retCount++;
                     terminalRetOffset = i;
                     terminalRetLength = length;
                     terminator = true;
                 } else if (b == 0xF3 && i + 1 < window && (code[i + 1] & 0xFF) == 0xC3) {
                     length = 2;
-                    sawRet = true;
                     retCount++;
                     terminalRetOffset = i;
                     terminalRetLength = length;
@@ -501,17 +558,17 @@ public class Linker {
                         if (TRACE_INLINE) {
                             System.out.printf("[nalim] %s: inline bail at +0x%x (opcode 0x%02x)%n", symbol, i, b);
                         }
-                        return false;
+                        return null;
                     }
                     length = insn.length;
                 }
 
-                if (i + length > window) return false;
-                for (int k = i; k < i + length; k++) {
-                    if (owner[k] != -1) return false;
-                    owner[k] = i;
+                if (length > 15 || i + length > window) return null;
+                for (int k = i + 1; k < i + length; k++) {
+                    if (lengths[k] != 0) return null; // overlap or queued branch into this instruction
+                    lengths[k] = INTERIOR;
                 }
-                decodedLen[i] = length;
+                lengths[i] = (byte) length;
                 end = Math.max(end, i + length);
 
                 if (!terminator && insn.ripDispOff >= 0 && !isRipNop(code, i)) {
@@ -526,14 +583,11 @@ public class Linker {
                     // inside the nmethod (cache-local, placement-independent).
                     // Requires alignment no stricter than the installed entry.
                     if (insn.ripLoadSize > 0
-                            && relocs < MAX_RELOCATIONS
+                            && (literals == null || literals.count < MAX_RELOCATIONS)
                             && Math.min(insn.ripLoadSize, 32) <= CODE_ENTRY_ALIGNMENT
-                            && isReadOnlyRange(operand, insn.ripLoadSize)) {
-                        litSrc[relocs] = operand;
-                        litOff[relocs] = dispPos;
-                        litNext[relocs] = i + insn.length;
-                        litSize[relocs] = insn.ripLoadSize;
-                        relocs++;
+                            && NativeMappings.isReadOnlyRange(operand, insn.ripLoadSize)) {
+                        if (literals == null) scratch.literals = literals = new Fixups();
+                        literals.add(operand, dispPos, i + length, insn.ripLoadSize);
                     } else {
                         // Rebase: keep the instruction aimed at its ORIGINAL
                         // operand — the disp32 is rewritten after the nmethod
@@ -541,12 +595,12 @@ public class Linker {
                         // loads whose literal is not poolable. Gate: the
                         // operand must be rel32-reachable from any possible
                         // nmethod placement (same test as direct jumps).
-                        if (NO_REBASE || rebases == MAX_RELOCATIONS) {
+                        if (NO_REBASE || (rebases != null && rebases.count == MAX_RELOCATIONS)) {
                             if (TRACE_INLINE) {
                                 System.out.printf("[nalim] %s: RIP operand at +0x%x needs rebase (%s)%n",
                                         symbol, i, NO_REBASE ? "disabled" : "slots exhausted");
                             }
-                            return false;
+                            return null;
                         }
                         long maxOffset = codeCache.getMaxCallTargetOffset(operand);
                         if (maxOffset < 0 || maxOffset > Integer.MAX_VALUE) {
@@ -554,12 +608,10 @@ public class Linker {
                                 System.out.printf("[nalim] %s: RIP operand at +0x%x beyond rel32 reach%n",
                                         symbol, i);
                             }
-                            return false;
+                            return null;
                         }
-                        rebTarget[rebases] = operand;
-                        rebOff[rebases] = dispPos;
-                        rebNext[rebases] = i + insn.length;
-                        rebases++;
+                        if (rebases == null) scratch.rebases = rebases = new Fixups();
+                        rebases.add(operand, dispPos, i + length, 0);
                     }
                 }
 
@@ -567,15 +619,10 @@ public class Linker {
                     int fallthrough = i + length;
                     for (int t = 0; t < (hasFallthrough ? 2 : 1); t++) {
                         int dest = (t == 0) ? target : fallthrough;
-                        if (dest < 0 || dest >= window) return false;
-                        if (owner[dest] != -1) {
-                            // Already-decoded destination (loop backedge or a
-                            // re-converging forward branch): only a verified
-                            // instruction boundary is acceptable.
-                            if (decodedLen[dest] == 0) return false;
-                        } else if (!queued[dest]) {
-                            queued[dest] = true;
-                            queue[tail++] = dest;
+                        if (dest < 0 || dest >= window || lengths[dest] == INTERIOR) return null;
+                        if (lengths[dest] == 0) {
+                            lengths[dest] = QUEUED;
+                            queue[tail++] = (byte) dest;
                         }
                     }
                     break;
@@ -584,26 +631,34 @@ public class Linker {
                 i += length;
             }
         }
-        if (!sawRet) {
+        if (retCount == 0) {
             if (TRACE_INLINE) {
                 System.out.printf("[nalim] %s: no ret within %d-byte window%n", symbol, window);
             }
-            return false;
+            return null;
         }
 
         boolean normalizeReturn = CallingConvention.needsReturnNormalization(returnType);
-        if (normalizeReturn
-                && (retCount != 1 || terminalRetOffset + terminalRetLength != end)) {
-            if (TRACE_INLINE) {
-                System.out.printf(
-                        "[nalim] %s: narrow return needs one terminal ret%n", symbol);
-            }
-            return false;
-        }
-
         // ── pass 2: copy body, emit literal pool, patch disp32 fields ───
         int bodyStart = buf.position();
-        if (normalizeReturn) {
+        int literalCount = literals == null ? 0 : literals.count;
+        int capacity = bodyStart + end + (normalizeReturn ? AMD64NarrowBody.NORMALIZATION_SIZE * retCount : 0);
+        for (int r = 0; r < literalCount; r++) {
+            int size = literals.size[r], align = Math.min(size, 32);
+            capacity = ((capacity + align - 1) & -align) + size;
+        }
+        capacity += 24; // finishEntryBarrier's slow path (also covers the smaller legacy trailer)
+        if (capacity > buf.capacity()) {
+            buf = ByteBuffer.allocate(capacity).order(buf.order()).put(buf.array(), 0, bodyStart);
+        }
+        int[] offsets = null;
+        if (normalizeReturn && (retCount != 1 || terminalRetOffset + terminalRetLength != end)) {
+            offsets = AMD64NarrowBody.emit(buf, code, lengths, end, returnType);
+            if (offsets == null) {
+                if (TRACE_INLINE) System.out.printf("[nalim] %s: narrow exits exceed rel8 range%n", symbol);
+                return null;
+            }
+        } else if (normalizeReturn) {
             // Keep every original offset before RET stable. Any forward Jcc
             // targeting the old RET now lands on the normalizer instead.
             buf.put(code, 0, terminalRetOffset);
@@ -612,40 +667,41 @@ public class Linker {
         } else {
             buf.put(code, 0, end);
         }
-        for (int r = 0; r < relocs; r++) {
+        if (literalCount != 0) literals.place(bodyStart, offsets);
+        for (int r = 0; r < literalCount; r++) {
             // Preserve alignment required by MOVAPS/MOVAPD/MOVDQA (and their
             // 32-byte VEX forms). The installed entry is CodeEntryAlignment-
             // aligned (32 by default on AMD64), so a buffer offset aligned to
             // min(litSize, 32) stays aligned after the nmethod is placed;
             // larger requirements were rejected during the decode pass.
-            int alignment = Math.min(litSize[r], 32);
+            int size = literals.size[r];
+            int alignment = Math.min(size, 32);
             while ((buf.position() & (alignment - 1)) != 0) {
                 buf.put((byte) 0);
             }
             int pool = buf.position();
-            for (int k = 0; k < litSize[r]; k++) {
-                buf.put(NativeMemory.unsafe.getByte(litSrc[r] + k));
-            }
+            NativeMemory.copyToArray(literals.target[r], buf.array(), pool, size);
+            buf.position(pool + size);
             // disp32 := pool − RIP, RIP = address of the next instruction.
             // Both live in the same nmethod, so the distance survives install.
-            buf.putInt(bodyStart + litOff[r], pool - (bodyStart + litNext[r]));
+            buf.putInt(literals.disp[r], pool - literals.next[r]);
         }
-        for (int r = 0; r < rebases; r++) {
+        int rebaseCount = rebases == null ? 0 : rebases.count;
+        if (rebaseCount != 0) rebases.place(bodyStart, offsets);
+        for (int r = 0; r < rebaseCount; r++) {
             // Placeholder 0 until the post-install patch: a stray execution in
             // the tiny install-to-patch window reads the nmethod's own bytes
             // instead of faulting on an unmapped address.
-            buf.putInt(bodyStart + rebOff[r], 0);
-            rebaseOut.add(new long[] {
-                    bodyStart + rebOff[r], bodyStart + rebNext[r], rebTarget[r]});
+            buf.putInt(rebases.disp[r], 0);
         }
 
         inlinedMethods++;
         if (TRACE_INLINE) {
             System.out.printf(
                     "[nalim] %s: inlined %dB body, %d literal(s), %d rebase(s)%n",
-                    symbol, buf.position() - bodyStart, relocs, rebases);
+                    symbol, buf.position() - bodyStart, literalCount, rebaseCount);
         }
-        return true;
+        return buf;
     }
 
     /** Decoded form of a single whitelisted instruction. */
@@ -1428,70 +1484,6 @@ public class Linker {
         return idx < limit ? code[idx] & 0xFF : -1;
     }
 
-    // Read-only mappings of this process (/proc/self/maps), used to decide
-    // whether a RIP-relative load targets an immutable literal. Cache is
-    // invalidated on every loadLibrary so later-loaded libs are covered.
-    private static volatile long[][] readOnlyRanges;
-
-    private static boolean isReadOnlyRange(long addr, int size) {
-        long[][] ranges = readOnlyRanges();
-        long end = addr + size;
-        if (Long.compareUnsigned(end, addr) < 0) {
-            return false;
-        }
-        for (long[] range : ranges) {
-            if (Long.compareUnsigned(addr, range[0]) >= 0 && Long.compareUnsigned(end, range[1]) <= 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static int mappedReadWindow(long addr, int maximum) {
-        for (long[] range : readOnlyRanges()) {
-            if (Long.compareUnsigned(addr, range[0]) >= 0
-                    && Long.compareUnsigned(addr, range[1]) < 0) {
-                long available = range[1] - addr;
-                return (int) Math.min(maximum, available);
-            }
-        }
-        return (int) Math.min(maximum, ((addr | 4095) + 1) - addr);
-    }
-
-    private static long[][] readOnlyRanges() {
-        long[][] ranges = readOnlyRanges;
-        if (ranges == null) {
-            synchronized (Linker.class) {
-                ranges = readOnlyRanges;
-                if (ranges == null) {
-                    readOnlyRanges = ranges = parseReadOnlyMaps();
-                }
-            }
-        }
-        return ranges;
-    }
-
-    private static long[][] parseReadOnlyMaps() {
-        // Linux only. Anywhere the file is missing/unreadable we return an
-        // empty set, so RIP literals are never relocated — stub fallback.
-        try {
-            List<long[]> list = new ArrayList<>();
-            for (String line : Files.readAllLines(Paths.get("/proc/self/maps"))) {
-                int sp = line.indexOf(' ');
-                if (sp < 0 || sp + 3 >= line.length()) continue;
-                if (line.charAt(sp + 1) != 'r' || line.charAt(sp + 2) == 'w') continue;
-                int dash = line.indexOf('-');
-                if (dash < 0 || dash >= sp) continue;
-                list.add(new long[] {
-                        Long.parseUnsignedLong(line.substring(0, dash), 16),
-                        Long.parseUnsignedLong(line.substring(dash + 1, sp), 16)
-                });
-            }
-            return list.toArray(new long[0][]);
-        } catch (Throwable t) {
-            return new long[0][];
-        }
-    }
 
     private static void checkMethodType(Method m) {
         int modifiers = m.getModifiers();
@@ -1505,19 +1497,20 @@ public class Linker {
         }
     }
 
-    private static byte[] parseHex(String hex) {
-        hex = hex.replaceAll("\\s+", "");
+    private static void installHexCode(Method m, String hex) {
+        checkMethodType(m);
+        ByteBuffer buf = rawCodeBuffer(HexCode.decodedLength(hex));
+        EntryBarrier entryBarrier = emitEntryBarrierPrologue(buf);
+        HexCode.emit(buf, hex);
+        installCode(m, buf, null, entryBarrier, null);
+    }
 
-        int length = hex.length();
-        if ((length & 1) != 0) {
-            throw new IllegalArgumentException("Invalid hex string");
-        }
-
-        byte[] code = new byte[length / 2];
-        for (int i = 0; i < code.length; i++) {
-            code[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
-        }
-        return code;
+    private static ByteBuffer rawCodeBuffer(int length) {
+        // AMD64's 22-byte entry + 24-byte slow path also covers legacy trailers.
+        // Leave headroom for JVMCI's signed, word-aligned code size, as before.
+        if (length > Integer.MAX_VALUE - 96) throw new IllegalArgumentException("Machine code too large for JVMCI");
+        return ByteBuffer.allocate(MARK_ENTRY_BARRIER_PATCH == null ? length : length + 46)
+                .order(ByteOrder.nativeOrder());
     }
 
     public static void installCode(Method m, byte[] code) {
@@ -1526,9 +1519,8 @@ public class Linker {
 
     public static void installCode(Method m, byte[] code, int length) {
         checkMethodType(m);
-        // Room for the executable AMD64 barrier and its out-of-line slow path,
-        // or for the legacy trailing verifier sequence on other architectures.
-        ByteBuffer buf = ByteBuffer.allocate(length + 96).order(ByteOrder.nativeOrder());
+        Objects.checkFromIndexSize(0, length, code.length);
+        ByteBuffer buf = rawCodeBuffer(length);
         EntryBarrier entryBarrier = emitEntryBarrierPrologue(buf);
         buf.put(code, 0, length);
         installCode(m, buf, null, entryBarrier, null);
@@ -1580,9 +1572,9 @@ public class Linker {
         // may replace the first five bytes with a NativeJump when the nmethod is
         // made non-entrant, while the barrier immediate remains independently
         // patchable at patchOffset below.
-        buf.put((byte) 0x0F).put((byte) 0x1F).put((byte) 0x44)
-                .put((byte) 0x00).put((byte) 0x00);
-        emitNopPad(buf, 4);
+        // The alignment NOP is a separate instruction from the five-byte entry
+        // NOP. Emit their existing little-endian encodings in a single store.
+        buf.putLong(LEGACY_PAD ? 0x9090900000441f0fL : 0x001f0f0000441f0fL);
 
         // Canonical eight-byte CMP. Its imm32 starts four bytes into the
         // instruction and is naturally aligned for atomic GC patching.
@@ -1598,39 +1590,9 @@ public class Linker {
         return new EntryBarrier(patchOffset, branchDispOffset, buf.position());
     }
 
-    // Canonical Intel/AMD multi-byte NOPs, indexed by width. Padding executes on
-    // every call (it sits before the entry-barrier CMP), so one wide NOP beats
-    // several 0x90s: fewer macro-ops through decode/op-cache per invocation.
-    private static final byte[][] NOPS = {
-            {},
-            {(byte) 0x90},
-            {0x66, (byte) 0x90},
-            {0x0F, 0x1F, 0x00},
-            {0x0F, 0x1F, 0x40, 0x00},
-            {0x0F, 0x1F, 0x44, 0x00, 0x00},
-            {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00},
-            {0x0F, 0x1F, (byte) 0x80, 0x00, 0x00, 0x00, 0x00},
-            {0x0F, 0x1F, (byte) 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
-    };
-
     // A/B diagnostics: -Dnalim.legacypad=true restores the original 1-byte-nop
     // padding so the coalesced-NOP prologue can be measured in isolation.
     private static final boolean LEGACY_PAD = Boolean.getBoolean("nalim.legacypad");
-
-    private static void emitNopPad(ByteBuffer buf, int alignment) {
-        int pad = -buf.position() & (alignment - 1);
-        if (LEGACY_PAD) {
-            for (int k = 0; k < pad; k++) {
-                buf.put((byte) 0x90);
-            }
-            return;
-        }
-        while (pad > 8) {
-            buf.put(NOPS[8]);
-            pad -= 8;
-        }
-        buf.put(NOPS[pad]);
-    }
 
     private static void finishEntryBarrier(ByteBuffer buf, EntryBarrier barrier) {
         // Put the frame-dismantling block before FRAME_COMPLETE. An asynchronous
@@ -1660,24 +1622,26 @@ public class Linker {
         buf.putInt(epilogueOffset - (slowReturnDisp + 4));
     }
 
+    private static final Site[] NO_SITES = new Site[0];
+    private static final Assumptions.Assumption[] NO_ASSUMPTIONS = new Assumptions.Assumption[0];
+    private static final HotSpotCompiledCode.Comment[] NO_COMMENTS = new HotSpotCompiledCode.Comment[0];
+    private static final DataPatch[] NO_PATCHES = new DataPatch[0];
+    private static final byte[] NO_DATA = new byte[0];
+
     private static void installCode(Method m, ByteBuffer buf, Call directJump, EntryBarrier entryBarrier,
-                                    List<long[]> rebases) {
+                                    Fixups rebases) {
         Site[] sites;
         int totalFrameSize = 0;
         if (entryBarrier != null) {
             finishEntryBarrier(buf, entryBarrier);
             totalFrameSize = 32; // return address + saved rbp + 16-byte aligned slow frame
 
-            List<Site> list = new ArrayList<>();
-            list.add(new Mark(entryBarrier.patchOffset, MARK_ENTRY_BARRIER_PATCH));
-            if (directJump != null) {
-                list.add(directJump);
-            }
-            if (MARK_FRAME_COMPLETE != null) {
-                list.add(new Mark(entryBarrier.frameCompleteOffset, MARK_FRAME_COMPLETE));
-            }
-            list.add(entryBarrier.slowCall);
-            sites = list.toArray(new Site[0]);
+            sites = new Site[2 + (directJump == null ? 0 : 1) + (MARK_FRAME_COMPLETE == null ? 0 : 1)];
+            int i = 0;
+            sites[i++] = new Mark(entryBarrier.patchOffset, MARK_ENTRY_BARRIER_PATCH);
+            if (directJump != null) sites[i++] = directJump;
+            if (MARK_FRAME_COMPLETE != null) sites[i++] = new Mark(entryBarrier.frameCompleteOffset, MARK_FRAME_COMPLETE);
+            sites[i] = entryBarrier.slowCall;
         } else if (MARK_ENTRY_BARRIER_PATCH != null) {
             int markOffset = callingConvention.emitNMethodBarrier(buf);
             // Emit both FRAME_COMPLETE (id=6) and ENTRY_BARRIER_PATCH (id=7)
@@ -1701,7 +1665,7 @@ public class Linker {
             }
         } else {
             // Pre-Loom JDK — installCode0 does not require an entry barrier.
-            sites = directJump != null ? new Site[] { directJump } : new Site[0];
+            sites = directJump != null ? new Site[] { directJump } : NO_SITES;
         }
 
         HotSpotResolvedJavaMethod rm = (HotSpotResolvedJavaMethod) jvmci.getMetaAccess().lookupJavaMethod(m);
@@ -1712,12 +1676,12 @@ public class Linker {
                 buf.array(),
                 buf.position(),
                 sites,
-                new Assumptions.Assumption[0],
+                NO_ASSUMPTIONS,
                 new ResolvedJavaMethod[] { rm },
-                new HotSpotCompiledCode.Comment[0],
-                new byte[0],
+                NO_COMMENTS,
+                NO_DATA,
                 1,
-                new DataPatch[0],
+                NO_PATCHES,
                 true,
                 totalFrameSize,
                 null,
@@ -1759,8 +1723,8 @@ public class Linker {
      * the body while displacements still hold the placeholder value.
      */
     private static void applyRebaseRelocations(
-            Method m, ByteBuffer buf, InstalledCode installed, List<long[]> rebases) {
-        if (rebases == null || rebases.isEmpty()) {
+            Method m, ByteBuffer buf, InstalledCode installed, Fixups rebases) {
+        if (rebases == null || rebases.count == 0) {
             return;
         }
         try {
@@ -1770,8 +1734,8 @@ public class Linker {
             }
             // Pass 1: verify the installed image mirrors the buffer around
             // every disp field, skipping bytes inside ANY recorded disp field.
-            for (long[] r : rebases) {
-                int dispOff = (int) r[0];
+            for (int r = 0; r < rebases.count; r++) {
+                int dispOff = rebases.disp[r];
                 for (int k = -4; k < 8; k++) {
                     int p = dispOff + k;
                     if (p < 0 || p >= buf.position() || insideRebaseField(p, rebases)) {
@@ -1785,16 +1749,16 @@ public class Linker {
                 }
             }
             // Pass 2: range-check every displacement, then write them all.
-            for (long[] r : rebases) {
-                long disp = r[2] - (start + (int) r[1]);
+            for (int r = 0; r < rebases.count; r++) {
+                long disp = rebases.target[r] - (start + rebases.next[r]);
                 if (disp < Integer.MIN_VALUE || disp > Integer.MAX_VALUE) {
                     throw new IllegalStateException(
                             "nalim: rebase target out of rel32 range: " + m);
                 }
             }
-            for (long[] r : rebases) {
-                NativeMemory.unsafe.putInt(
-                        start + (int) r[0], (int) (r[2] - (start + (int) r[1])));
+            for (int r = 0; r < rebases.count; r++) {
+                NativeMemory.unsafe.putInt(start + rebases.disp[r],
+                        (int) (rebases.target[r] - (start + rebases.next[r])));
             }
         } catch (Throwable t) {
             // The nmethod is already the method's default code; never leave a
@@ -1825,9 +1789,9 @@ public class Linker {
                 && (code[j] & 0xFF) == 0x0F && (code[j + 1] & 0xFF) == 0x1F;
     }
 
-    private static boolean insideRebaseField(int p, List<long[]> rebases) {
-        for (long[] r : rebases) {
-            int off = (int) r[0];
+    private static boolean insideRebaseField(int p, Fixups rebases) {
+        for (int r = 0; r < rebases.count; r++) {
+            int off = rebases.disp[r];
             if (p >= off && p < off + 4) {
                 return true;
             }

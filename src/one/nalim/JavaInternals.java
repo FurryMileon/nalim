@@ -81,16 +81,6 @@ class JavaInternals {
         }
     }
 
-    public static Method getPrivateMethod(Class<?> cls, String name, Class<?>... params) {
-        try {
-            Method m = cls.getDeclaredMethod(name, params);
-            setAccessible(m);
-            return m;
-        } catch (NoSuchMethodException e) {
-            throw new IllegalArgumentException(e);
-        }
-    }
-
     public static <T> Constructor<T> getPrivateConstructor(Class<T> cls, Class<?>... params) {
         try {
             Constructor<T> c = cls.getDeclaredConstructor(params);

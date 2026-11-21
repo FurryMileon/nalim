@@ -46,120 +46,57 @@ class AMD64WindowsCallingConvention extends CallingConvention {
     private static final int[] JAVA_INT_REGS = {RDX, R8, R9, RDI, RSI, RCX};
     private static final int[] NATIVE_INT_REGS = {RCX, RDX, R8, R9};
 
-    // Per-argument routing, precomputed in signature order.
-    private static final class ArgPlan {
-        boolean fp;          // FP (float/double) vs integer class (incl. objects)
-        boolean wide;        // 64-bit move required (long / object)
-        boolean isFloat;     // f32 (movss) vs f64 (movsd) for stack stores
-        int objOffset = -1;  // >= 0: object/array — lea with this base offset
-        int javaReg = -1;    // source register (int id or xmm index), or -1
-        int javaSlot = -1;   // source Java stack slot (8-byte units), or -1
+    private static boolean isFp(Class<?> type) {
+        return type == float.class || type == double.class;
     }
 
-    private static ArgPlan[] plan(Class<?>[] types, Annotation[][] annotations) {
-        ArgPlan[] plans = new ArgPlan[types.length];
-        int intIdx = 0, fpIdx = 0, spill = 0;
-        for (int i = 0; i < types.length; i++) {
-            ArgPlan p = new ArgPlan();
-            Class<?> type = types[i];
-            if (type == float.class || type == double.class) {
-                p.fp = true;
-                p.isFloat = (type == float.class);
-                p.wide = (type == double.class);
-                if (fpIdx < 8) {
-                    p.javaReg = fpIdx++;
-                } else {
-                    fpIdx++;
-                    p.javaSlot = spill++;
-                }
-            } else {
-                p.wide = (type == long.class) || !type.isPrimitive();
-                if (!type.isPrimitive()) {
-                    p.objOffset = annotations != null
-                            ? baseOffset(type, annotations[i]) : 0;
-                }
-                if (intIdx < 6) {
-                    p.javaReg = JAVA_INT_REGS[intIdx++];
-                } else {
-                    intIdx++;
-                    p.javaSlot = spill++;
-                }
-            }
-            plans[i] = p;
+    private static int countFp(Class<?>[] types, int regArgs) {
+        int fp = 0;
+        for (int i = 0; i < regArgs; i++) {
+            if (isFp(types[i])) fp++;
         }
-        return plans;
+        return fp;
+    }
+
+    private static int objectOffset(Class<?> type, Annotation[][] annotations, int p) {
+        return annotations != null && !type.isPrimitive() ? baseOffset(type, annotations[p]) : 0;
     }
 
     @Override
     public void javaToNative(ByteBuffer buf, Class<?>[] types, Annotation[][] annotations) {
-        // Register-argument shuffle only. Stack stores for positions >= 4 are
-        // emitted by the framed-call prologue BEFORE these moves run — their
-        // sources (xmm and integer argument registers) must still be pristine.
-        emitRegisterMoves(buf, plan(types, annotations), types.length);
+        int regArgs = Math.min(types.length, 4);
+        emitRegisterMoves(buf, types, annotations, regArgs, countFp(types, regArgs));
     }
 
-    private void emitRegisterMoves(ByteBuffer buf, ArgPlan[] plans, int argCount) {
-        int regArgs = Math.min(argCount, 4);
-
-        // FP register moves: source xmm index f <= position p, and the
-        // (f -> p) mapping is strictly increasing, so descending order never
-        // clobbers a pending source.
-        for (int p = regArgs - 1; p >= 0; p--) {
-            ArgPlan a = plans[p];
-            if (a.fp && a.javaReg != p) {
-                emitMovaps(buf, p, a.javaReg);
-            }
-        }
-
-        // Integer register moves form an arbitrary (cycle-free in practice)
-        // parallel-move set; resolve by always emitting a move whose target
-        // is no longer needed as a source, with rax as cycle breaker.
-        int[] src = new int[4];
-        int[] dst = new int[4];
-        int[] pos = new int[4];
-        int n = 0;
-        for (int p = 0; p < regArgs; p++) {
-            ArgPlan a = plans[p];
-            if (!a.fp && (a.javaReg != NATIVE_INT_REGS[p] || a.objOffset >= 0)) {
-                src[n] = a.javaReg;
-                dst[n] = NATIVE_INT_REGS[p];
-                pos[n] = p;
-                n++;
-            }
-        }
-        boolean[] done = new boolean[n];
-        for (int remaining = n; remaining > 0; ) {
-            int progress = -1;
-            for (int i = 0; i < n && progress < 0; i++) {
-                if (done[i]) continue;
-                boolean blocked = false;
-                for (int k = 0; k < n; k++) {
-                    if (k != i && !done[k] && src[k] == dst[i]) {
-                        blocked = true;
-                        break;
-                    }
-                }
-                if (!blocked) progress = i;
-            }
-            if (progress < 0) {
-                // Cycle: park one source in rax and retarget its move.
-                for (int i = 0; i < n; i++) {
-                    if (!done[i]) {
-                        emitMovReg(buf, RAX, src[i], true);
-                        src[i] = RAX;
-                        break;
-                    }
-                }
-                continue;
-            }
-            ArgPlan a = plans[pos[progress]];
-            if (a.objOffset >= 0) {
-                emitLea64(buf, dst[progress], src[progress], a.objOffset);
+    private static void emitRegisterMoves(ByteBuffer buf, Class<?>[] types, Annotation[][] annotations,
+                                          int regArgs, int fp) {
+        // For an integer at position p with f preceding FP args, its Java GPR
+        // is at Win64 index p-f+1 (extend the Win64 list by rdi at index 4).
+        // After the first FP, this index is <= p. FP sources are also <= p.
+        // Both mappings increase within their class: walk this suffix backward.
+        int p = regArgs;
+        while (fp != 0) {
+            Class<?> type = types[--p];
+            if (isFp(type)) {
+                if (--fp != p) emitMovaps(buf, p, fp);
             } else {
-                emitMovReg(buf, dst[progress], src[progress], a.wide);
+                emitIntegerArg(buf, type, annotations, p, JAVA_INT_REGS[p - fp]);
             }
-            done[progress] = true;
-            remaining--;
+        }
+        // Remaining leading integers come from index i+1; move them forward.
+        // No suffix destination overlaps these sources (the first FP is at p).
+        for (int i = 0; i < p; i++) {
+            emitIntegerArg(buf, types[i], annotations, i, JAVA_INT_REGS[i]);
+        }
+    }
+
+    private static void emitIntegerArg(ByteBuffer buf, Class<?> type, Annotation[][] annotations, int p, int src) {
+        int dst = NATIVE_INT_REGS[p];
+        int offset = objectOffset(type, annotations, p);
+        if (offset != 0) {
+            emitLea64(buf, dst, src, offset);  // also needed for an in-place field address
+        } else if (src != dst) {
+            emitMovReg(buf, dst, src, type == long.class || !type.isPrimitive());
         }
     }
 
@@ -203,27 +140,35 @@ class AMD64WindowsCallingConvention extends CallingConvention {
         }
         emitRspAdjust(buf, 0xEC, frame);                // sub rsp, frame
 
-        ArgPlan[] plans = plan(types, annotations);
+        int regArgs = Math.min(types.length, 4);
+        int regFp = countFp(types, regArgs);
+        int fp = regFp, gp = regArgs - regFp, spillOff = frame + 8;
         for (int p = 4; p < types.length; p++) {
-            ArgPlan a = plans[p];
-            int natOff = 32 + 8 * (p - 4);
-            if (a.javaSlot >= 0) {
-                // Java stack -> rax -> native stack (raw 8-byte copy).
-                emitMovRaxFromRsp(buf, frame + 8 + 8 * a.javaSlot);
-                if (a.objOffset > 0) {
-                    emitLea64(buf, RAX, RAX, a.objOffset);
-                }
-                emitMovToRsp(buf, natOff, RAX, true);
-            } else if (a.fp) {
-                emitMovssSdToRsp(buf, natOff, a.javaReg, a.isFloat);
-            } else if (a.objOffset >= 0) {
-                emitLea64(buf, RAX, a.javaReg, a.objOffset);
-                emitMovToRsp(buf, natOff, RAX, true);
-            } else {
-                emitMovToRsp(buf, natOff, a.javaReg, a.wide);
+            Class<?> type = types[p];
+            int natOff = 8 * p;  // first four slots are the shadow space
+            boolean floating = isFp(type);
+            if (floating && fp < 8) {
+                emitMovssSdToRsp(buf, natOff, fp++, type == float.class);
+                continue;
             }
+
+            boolean wide = type == long.class || type == double.class || !type.isPrimitive();
+            int src;
+            if (!floating && gp < JAVA_INT_REGS.length) {
+                src = JAVA_INT_REGS[gp++];
+            } else {
+                emitMovRaxFromRsp(buf, spillOff, wide);
+                spillOff += 8;
+                src = RAX;
+            }
+            int offset = objectOffset(type, annotations, p);
+            if (offset != 0) {
+                emitLea64(buf, RAX, src, offset);
+                src = RAX;
+            }
+            emitMovToRsp(buf, natOff, src, wide);
         }
-        emitRegisterMoves(buf, plans, types.length);
+        emitRegisterMoves(buf, types, annotations, regArgs, regFp);
         return frame;
     }
 
@@ -298,9 +243,10 @@ class AMD64WindowsCallingConvention extends CallingConvention {
         putRspModrm(buf, reg, disp);
     }
 
-    // mov rax, [rsp+disp]
-    private static void emitMovRaxFromRsp(ByteBuffer buf, int disp) {
-        buf.put((byte) 0x48).put((byte) 0x8B);
+    // mov rax/eax, [rsp+disp]
+    private static void emitMovRaxFromRsp(ByteBuffer buf, int disp, boolean wide) {
+        if (wide) buf.put((byte) 0x48);
+        buf.put((byte) 0x8B);
         putRspModrm(buf, RAX, disp);
     }
 
