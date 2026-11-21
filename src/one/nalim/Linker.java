@@ -478,16 +478,26 @@ public class Linker {
                 return buf;
             }
         }
-        ByteBuffer inline = tryInlineWindow(buf, address, symbol, returnType, scratch, window);
+        boolean splitEligible = shuffleStart >= 0 && hasSeveralIntegerArgs(types);
+        ByteBuffer inline = tryInlineWindow(buf, address, symbol, returnType, scratch, window, splitEligible);
         if (inline != null || window == MAX_INLINE_BYTES) return inline;
 
         int expanded = NativeMappings.extendCodeWindow(address, scratch.code, window);
         if (expanded <= window) return null;
-        return tryInlineWindow(buf, address, symbol, returnType, scratch, expanded);
+        return tryInlineWindow(buf, address, symbol, returnType, scratch, expanded, splitEligible);
+    }
+
+    private static boolean hasSeveralIntegerArgs(Class<?>[] types) {
+        int count = 0;
+        for (Class<?> type : types) {
+            if (type != float.class && type != double.class && ++count == 4) return true;
+        }
+        return false;
     }
 
     private static ByteBuffer tryInlineWindow(ByteBuffer buf, long address, String symbol,
-                                              Class<?> returnType, InlineScratch scratch, int window) {
+                                              Class<?> returnType, InlineScratch scratch, int window,
+                                              boolean splitEligible) {
         byte[] code = scratch.code;
 
         // ── pass 1: decode and validate ─────────────────────────────────
@@ -496,6 +506,8 @@ public class Linker {
         if (literals != null) literals.count = 0;
         if (rebases != null) rebases.count = 0;
         int end = 0;
+        int instructions = 0;
+        boolean hasBranch = false;
         int retCount = 0;
         int terminalRetOffset = -1;
         int terminalRetLength = 0;
@@ -590,6 +602,7 @@ public class Linker {
                 }
                 lengths[i] = (byte) length;
                 end = Math.max(end, i + length);
+                instructions++;
 
                 if (!terminator && insn.ripDispOff >= 0 && !isRipNop(code, i)) {
                     int dispPos = i + insn.ripDispOff;
@@ -636,6 +649,7 @@ public class Linker {
                 }
 
                 if (branch) {
+                    hasBranch = true;
                     int fallthrough = i + length;
                     for (int t = 0; t < (hasFallthrough ? 2 : 1); t++) {
                         int dest = (t == 0) ? target : fallthrough;
@@ -660,7 +674,13 @@ public class Linker {
 
         boolean normalizeReturn = CallingConvention.needsReturnNormalization(returnType);
         // ── pass 2: copy body, emit literal pool, patch disp32 fields ───
-        int bodyStart = buf.position();
+        int preambleEnd = buf.position();
+        // A separate target can help Zen dispatch a substantial body after
+        // a shuffle of four or more integer arguments. Keep smaller shuffles and
+        // tiny, branching, naked or narrow-return bodies on the fall-through path.
+        boolean splitBody = splitEligible && !normalizeReturn && !hasBranch
+                && instructions >= 8 && AMD64Dispatch.SPLIT_INLINE_BODY;
+        int bodyStart = preambleEnd + (splitBody ? 2 : 0);
         int literalCount = literals == null ? 0 : literals.count;
         int capacity = bodyStart + end + (normalizeReturn ? AMD64NarrowBody.NORMALIZATION_SIZE * retCount : 0);
         for (int r = 0; r < literalCount; r++) {
@@ -669,8 +689,9 @@ public class Linker {
         }
         capacity += 24; // finishEntryBarrier's slow path (also covers the smaller legacy trailer)
         if (capacity > buf.capacity()) {
-            buf = ByteBuffer.allocate(capacity).order(buf.order()).put(buf.array(), 0, bodyStart);
+            buf = ByteBuffer.allocate(capacity).order(buf.order()).put(buf.array(), 0, preambleEnd);
         }
+        if (splitBody) buf.putShort((short) 0x00EB);             // jmp to the following instruction
         int[] offsets = null;
         if (normalizeReturn && (retCount != 1 || terminalRetOffset + terminalRetLength != end)) {
             offsets = AMD64NarrowBody.emit(buf, code, lengths, end, returnType);
