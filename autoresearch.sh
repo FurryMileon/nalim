@@ -11,7 +11,8 @@ fi
 jdk=${JAVA_HOME:-/usr/lib/jvm/java-25-openjdk}
 jdk=$(realpath -- "$jdk")
 version=$("$jdk/bin/java" -version 2>&1)
-if [[ ${version%%$'\n'*} != *'version "25.'* ]] || [[ $version != *'Server VM'* ]]; then
+feature_re='version "([0-9]+)([."+-])'
+if ! [[ ${version%%$'\n'*} =~ $feature_re ]] || [[ ${BASH_REMATCH[1]} != 25 || $version != *'Server VM'* ]]; then
     printf 'This benchmark needs a HotSpot JDK 25; found:\n%s\n' "$version" >&2; exit 1
 fi
 

@@ -21,7 +21,7 @@ package one.nalim;
 import java.lang.annotation.Annotation;
 import java.nio.ByteBuffer;
 
-class AMD64WindowsCallingConvention extends CallingConvention {
+class AMD64WindowsCallingConvention extends AMD64CallingConvention {
 
     // Win64 native convention is POSITIONAL: argument i (of any class) uses
     // slot i — integer args in rcx,rdx,r8,r9, FP args in xmm0-xmm3, and every
@@ -262,54 +262,5 @@ class AMD64WindowsCallingConvention extends CallingConvention {
         // correct there — no argument shuffle, no shadow-space ownership.
         buf.putShort((short) 0xb848).putLong(address);  // mov rax, address
         buf.putShort((short) 0xe0ff);                   // jmp rax
-    }
-
-    @Override
-    void emitCallAndNormalize(
-            ByteBuffer buf, long address, Class<?> returnType, Class<?>[] parameterTypes) {
-        // Naked narrow-return targets only (framed path handles the rest).
-        if (parameterTypes.length > 4) {
-            throw new IllegalArgumentException(
-                    "Narrow return with native stack arguments is not supported");
-        }
-
-        // 32-byte Win64 shadow space plus 8 bytes for call-site alignment.
-        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xEC).put((byte) 0x28);
-        buf.putShort((short) 0xb848).putLong(address);  // mov rax, address
-        buf.putShort((short) 0xd0ff);                   // call rax
-        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xC4).put((byte) 0x28);
-        emitAMD64ReturnNormalization(buf, returnType);
-        buf.put((byte) 0xC3);                          // ret
-    }
-
-    @Override
-    int emitDirectCallAndNormalize(
-            ByteBuffer buf, Class<?> returnType, Class<?>[] parameterTypes) {
-        if (parameterTypes.length > 4) {
-            throw new IllegalArgumentException(
-                    "Narrow return with native stack arguments is not supported");
-        }
-
-        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xEC).put((byte) 0x28);
-        int pcOffset = buf.position();
-        buf.put((byte) 0xE8).putInt(0);                 // call rel32 — JVMCI patches disp32
-        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xC4).put((byte) 0x28);
-        emitAMD64ReturnNormalization(buf, returnType);
-        buf.put((byte) 0xC3);                          // ret
-        return pcOffset;
-    }
-
-    @Override
-    int emitNMethodBarrier(ByteBuffer buf) {
-        // Same sequence as Linux x64 — r15 is the JavaThread register on
-        // HotSpot Windows-x64 as well, and the barrier opcode is OS-agnostic.
-        while ((buf.position() & 3) != 0) {
-            buf.put((byte) 0x90);                       // nop
-        }
-        int markOffset = buf.position();
-        // cmp dword ptr [r15 + 0], 0x00000000  (see AMD64LinuxCallingConvention)
-        buf.put((byte) 0x41).put((byte) 0x81).put((byte) 0x7F).put((byte) 0x00);
-        buf.putInt(0);
-        return markOffset;
     }
 }

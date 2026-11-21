@@ -232,17 +232,16 @@ public class InlineFixturesTest {
         }
         eq(Edges.fxb_word(1), -32768, "rel32 fallthrough");
         eq(Edges.fxb_word(0), 0x7abc, "mutable RIP load");
-        eq(Edges.fxb_word_control(), 0x7abc, "native rebase reachability control");
-        if (inlineStatus.get("fxb_word_control") && !inlineStatus.get("fxb_word")) {
-            throw new AssertionError("reachable live RIP operand dropped the rel32 leaf to the bridge");
-        }
+        eq(Edges.fxb_word_control(), 0x7abc, "unconditional mutable RIP load");
         Edges.fxb_set_word(0xcafe8003);
-        eq(Edges.fxb_word(0), -32765, "relocated load after native write");
+        eq(Edges.fxb_word(0), -32765, "conditional load after native write");
+        eq(Edges.fxb_word_control(), -32765, "unconditional load after native write");
         eq(Edges.fxb_indirect(25), 42, "indirect entry before update");
         Edges.fxb_switch();
         eq(Edges.fxb_indirect(25), 8, "indirect entry after update");
         eq(Edges.fxb_long_chain(41), 42, "bounded thunk-chain fallback");
-        for (String symbol : new String[] { "fxb_rel8_limit", "fxb_indirect", "fxb_long_chain" }) {
+        for (String symbol : new String[] { "fxb_rel8_limit", "fxb_word", "fxb_word_control",
+                "fxb_set_word", "fxb_indirect", "fxb_switch", "fxb_long_chain" }) {
             if (inlineStatus.get(symbol)) throw new AssertionError("expected fallback: " + symbol);
         }
 

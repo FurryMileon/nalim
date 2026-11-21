@@ -1,8 +1,6 @@
 import one.nalim.Link;
 import one.nalim.Linker;
 
-import java.lang.reflect.Method;
-
 public final class NarrowReturnTest {
     private static volatile int sink;
 
@@ -35,14 +33,22 @@ public final class NarrowReturnTest {
         static native byte ninthDouble(
                 double a, double b, double c, double d, double e,
                 double f, double g, double h, double ninth);
+
+        @Link(name = "nalim_narrow_mixed")
+        static native short mixed(
+                int i1, int i2, int i3, int i4, int i5, int i6,
+                double d1, double d2, double d3, double d4, double d5, double d6, double d7, double d8,
+                int i7, float f1, long l1, double d9, int i8, float f2, long l2, double d10,
+                int i9, float f3, long l3, double d11, int i10, float f4, long l4, double d12);
     }
 
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
         String library = args.length == 0
                 ? "test/libnalim_narrow_returns.so"
                 : args[0];
         Linker.loadLibrary(new java.io.File(library).getAbsolutePath());
         Linker.linkClass(RegisterOnly.class);
+        Linker.linkClass(StackArguments.class);
 
         for (int i = 0; i < 1_000_000; i++) {
             check(!RegisterOnly.boolFalse(), "dirty false became true");
@@ -52,41 +58,25 @@ public final class NarrowReturnTest {
             check(RegisterOnly.charValue() == '\uabcd', "char was not zero-extended");
             check(RegisterOnly.stackAligned(), "native call stack is misaligned");
             sink ^= RegisterOnly.byteValue();
-        }
 
-        boolean noInline = Boolean.getBoolean("nalim.noinline");
-        if (noInline) {
-            expectStackArgumentRejection("seventhLong", long.class, long.class,
-                    long.class, long.class, long.class, long.class, long.class);
-            expectStackArgumentRejection("ninthDouble", double.class, double.class,
-                    double.class, double.class, double.class, double.class,
-                    double.class, double.class, double.class);
-        } else {
-            Linker.linkClass(StackArguments.class);
-            check(StackArguments.seventhLong(1, 2, 3, 4, 5, 6, -128) == -128,
+            int value = (i & 255) - 128;
+            check(StackArguments.seventhLong(1, 2, 3, 4, 5, 6, value) == value,
                     "seventh GPR argument moved");
-            check(StackArguments.ninthDouble(1, 2, 3, 4, 5, 6, 7, 8, -42) == -42,
+            check(StackArguments.ninthDouble(1, 2, 3, 4, 5, 6, 7, 8, value) == value,
                     "ninth XMM argument moved");
+            check(StackArguments.mixed(1, 2, 3, 4, 5, 6,
+                    1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5,
+                    -7, -1.25f, 0x100000001L, 9.5, -8, -2.25f, 0x200000002L, 10.5,
+                    -9, -3.25f, 0x300000003L, 11.5, -10, -4.25f, 0x400000004L, 12.5) == -12345,
+                    "mixed register or stack argument moved");
         }
 
         System.out.printf(
                 "NARROW_RETURN_OK noinline=%s direct=%d inline=%d sink=%d%n",
-                noInline,
+                Boolean.getBoolean("nalim.noinline"),
                 Linker.getDirectJumpMethodCount(),
                 Linker.getInlinedMethodCount(),
                 sink);
-    }
-
-    private static void expectStackArgumentRejection(
-            String name, Class<?>... parameterTypes) throws Exception {
-        Method method = StackArguments.class.getDeclaredMethod(name, parameterTypes);
-        try {
-            Linker.linkMethod(method);
-            throw new AssertionError("Expected stack-argument rejection for " + name);
-        } catch (IllegalArgumentException expected) {
-            check(expected.getMessage().contains("stack arguments"),
-                    "unexpected rejection: " + expected);
-        }
     }
 
     private static void check(boolean condition, String message) {

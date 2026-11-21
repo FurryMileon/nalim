@@ -26,6 +26,9 @@ $feature = [int]$versionMatch.Groups[1].Value
 if ($feature -lt 21) {
     throw "The Nalim runtime image requires JDK 21 or newer"
 }
+if (-not (Test-Path -LiteralPath (Join-Path $modulePath "jdk.internal.vm.ci.jmod") -PathType Leaf)) {
+    throw "This JDK does not contain jdk.internal.vm.ci; Nalim requires a JVMCI-capable HotSpot build"
+}
 if (Test-Path -LiteralPath $Output) {
     throw "Output already exists: $Output. Remove it explicitly before rebuilding."
 }

@@ -21,7 +21,7 @@ package one.nalim;
 import java.lang.annotation.Annotation;
 import java.nio.ByteBuffer;
 
-class AMD64LinuxCallingConvention extends CallingConvention {
+class AMD64LinuxCallingConvention extends AMD64CallingConvention {
 
     // x64 calling convention (Linux, macOS):
     //     Java: rsi, rdx, rcx,  r8,  r9, rdi, stack
@@ -89,71 +89,5 @@ class AMD64LinuxCallingConvention extends CallingConvention {
     public void emitCall(ByteBuffer buf, long address) {
         buf.putShort((short) 0xb848).putLong(address);  // mov rax, address
         buf.putShort((short) 0xe0ff);                   // jmp rax
-    }
-
-    private static void checkRegisterOnlyArgs(Class<?>[] parameterTypes) {
-        int integerArgs = 0;
-        int floatingArgs = 0;
-        for (Class<?> type : parameterTypes) {
-            if (type == float.class || type == double.class) {
-                floatingArgs++;
-            } else {
-                integerArgs++;
-            }
-        }
-        if (integerArgs > 6 || floatingArgs > 8) {
-            throw new IllegalArgumentException(
-                    "Narrow return with native stack arguments is not supported");
-        }
-    }
-
-    @Override
-    void emitCallAndNormalize(
-            ByteBuffer buf, long address, Class<?> returnType, Class<?>[] parameterTypes) {
-        checkRegisterOnlyArgs(parameterTypes);
-
-        // The nmethod is entered with RSP%16 == 8. Reserve one slot so the
-        // nested System V call sees its required 16-byte-aligned call site.
-        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xEC).put((byte) 0x08);
-        buf.putShort((short) 0xb848).putLong(address);  // mov rax, address
-        buf.putShort((short) 0xd0ff);                   // call rax
-        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xC4).put((byte) 0x08);
-        emitAMD64ReturnNormalization(buf, returnType);
-        buf.put((byte) 0xC3);                          // ret
-    }
-
-    @Override
-    int emitDirectCallAndNormalize(
-            ByteBuffer buf, Class<?> returnType, Class<?>[] parameterTypes) {
-        checkRegisterOnlyArgs(parameterTypes);
-
-        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xEC).put((byte) 0x08);
-        int pcOffset = buf.position();
-        buf.put((byte) 0xE8).putInt(0);                 // call rel32 — JVMCI patches disp32
-        buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xC4).put((byte) 0x08);
-        emitAMD64ReturnNormalization(buf, returnType);
-        buf.put((byte) 0xC3);                          // ret
-        return pcOffset;
-    }
-
-    @Override
-    int emitNMethodBarrier(ByteBuffer buf) {
-        // 4-byte alignment required for atomic patching of disp8/imm32.
-        while ((buf.position() & 3) != 0) {
-            buf.put((byte) 0x90);                       // nop
-        }
-        int markOffset = buf.position();
-        // cmp dword ptr [r15 + 0], 0x00000000   (8 bytes)
-        //   41         REX.B (extends r/m to r15)
-        //   81 /7      cmp r/m32, imm32  (opcode-extension /7 = CMP)
-        //   7F         ModR/M  mod=01, reg=/7, rm=111 → [r15+disp8]
-        //   00         disp8   (HotSpot patches this to threadDisarmedOffset)
-        //   00 00 00 00 imm32  (HotSpot patches this to the armed-epoch value)
-        // No `je` follows — the cmp executes (or rather wouldn't, since we
-        // sit after the tail-call) but never branches anywhere. Barrier passes
-        // JVMCI validation; runtime patching of disp/imm is harmless.
-        buf.put((byte) 0x41).put((byte) 0x81).put((byte) 0x7F).put((byte) 0x00);
-        buf.putInt(0);
-        return markOffset;
     }
 }

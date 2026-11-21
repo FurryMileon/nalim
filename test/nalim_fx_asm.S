@@ -303,7 +303,7 @@ FUNC(fxb_rel8_limit)
     ret
 
 // Force rel32 edges over a non-terminal return. Only the operand differs:
-// the read-only version always inlines, the live one needs rel32 reach.
+// the read-only literal can be pooled, the writable one must stay live.
     .macro word_exit source
     test edi, edi
     .byte 0x0f, 0x84

@@ -1,9 +1,9 @@
 {
     "schemaVersion": 1,
     "id": "nalim",
-    "version": "1.2.3-patched-autoinline",
+    "version": "1.2.4-patched-autoinline",
     "name": "Nalim",
-    "description": "Near-zero-overhead JVMCI native linking with JDK 21+ entry barriers and AMD64 auto-inlining.",
+    "description": "JVMCI native linking for x86-64 and AArch64, with conservative AMD64 auto-inlining.",
     "authors": ["Andrei Pangin", "FurryMileon"],
     "license": "GPL-2.0-or-later",
     "environment": "*",

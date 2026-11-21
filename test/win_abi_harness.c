@@ -1,11 +1,10 @@
-// Executes the Windows-x64 framed adapters emitted by WinEmitProbe on Linux.
+// Executes the Windows-x64 adapters emitted by WinEmitProbe on Linux.
 //
 // The adapter's INPUT is HotSpot's compiled-Java Windows convention:
 //     ints: rdx, r8, r9, rdi, rsi, rcx, then stack ([rsp+8+8k] at entry)
 //       fp: xmm0-xmm7, then stack
-// Its OUTPUT is a Win64 native call, which GCC can receive natively via
-// __attribute__((ms_abi)). Compare against System-V twins or the individual
-// source values, including the actual field displacement from the probe VM.
+// Framed adapters call Win64 native callees (__attribute__((ms_abi))).
+// Naked adapters call assembly using the unchanged Java convention.
 //
 // Build: gcc -O1 -o win_abi_harness win_abi_harness.c
 // Run:   ./win_abi_harness   (in the directory with win_adapter_*.bin)
@@ -97,6 +96,18 @@ __asm__(
     "movaps %xmm0, 8(%rsp)\n\t"    // must be aligned and owned by the callee
     "movaps %xmm1, 24(%rsp)\n\t"
     "mov $1, %eax\n\t"
+    "ret\n"
+);
+
+// Java GP #5/#6 are esi/ecx, not Win64 native stack arguments.
+extern void java_narrow(void);
+__asm__(
+    ".text\n"
+    ".type java_narrow, @function\n"
+    "java_narrow:\n\t"
+    "mov %esi, %eax\n\t"
+    "sub %ecx, %eax\n\t"
+    "xor $0x55550000, %eax\n\t"
     "ret\n"
 );
 double ret_xmm0;
@@ -270,6 +281,7 @@ int main(void) {
 
     check_l("shadow", run_adapter(load_adapter("shadow", (void *) ms_shadow)), 1);
     check_l("ffll", run_adapter(load_adapter("ffll", (void *) ms_ffll)), 1);
+    check_i("naked_direct", (int32_t) run_adapter(load_adapter("naked_direct", (void *) java_narrow)), -1);
     FILE *offsets = fopen("win_field_offset.txt", "r");
     if (!offsets || fscanf(offsets, "%u", &field_offset) != 1 || !field_offset) {
         fprintf(stderr, "Missing or invalid win_field_offset.txt\n");

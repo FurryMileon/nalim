@@ -32,21 +32,23 @@ final class NativeMappings {
     // Never merge adjacent VMAs, even when their permissions match.
     private static final long EXECUTABLE = 1;
     private static final long[] NO_RANGES = new long[0];
-    private static volatile long[] cached;
+    private final long[] ranges;
     private static final int MAX_JUMPS = 4;
     private static final Path PROCESS_MAPPINGS = Paths.get("/proc/self/maps");
     private static final Path PROCESS_MEMORY = Paths.get("/proc/self/mem");
 
-    private NativeMappings() {
+    private NativeMappings(long[] ranges) {
+        this.ranges = ranges;
     }
 
-    static synchronized void invalidate() {
-        cached = null;
+    // Borrowed only for the body currently being decoded. A later binding
+    // must see intervening mprotect/munmap changes, even without a library load.
+    static NativeMappings snapshot() {
+        return new NativeMappings(parse());
     }
 
-    static boolean isReadOnlyRange(long address, int size) {
+    boolean isReadOnlyRange(long address, int size) {
         if (size <= 0) return false;
-        long[] ranges = ranges();
         int i = containing(ranges, address);
         return i >= 0 && Long.compareUnsigned(ranges[i + 1] - address, size) >= 0;
     }
@@ -67,10 +69,29 @@ final class NativeMappings {
         return readAt(address, ByteBuffer.wrap(bytes)) ? bytes : null;
     }
 
+    static FileChannel openMemory() throws IOException {
+        return FileChannel.open(PROCESS_MEMORY);
+    }
+
+    private static boolean readAt(FileChannel memory, long address, ByteBuffer dst) throws IOException {
+        // procfs uses a signed file offset; don't pass a high unsigned VA to FileChannel.
+        int size = dst.remaining();
+        return address >= 0 && memory.read(dst, address) == size;
+    }
+
+    static boolean readLiteral(FileChannel memory, long address, ByteBuffer pool, int size) throws IOException {
+        int limit = pool.limit();
+        pool.limit(pool.position() + size);
+        try {
+            return readAt(memory, address, pool);
+        } finally {
+            pool.limit(limit);
+        }
+    }
+
     private static boolean readAt(long address, ByteBuffer dst) {
-        try (FileChannel memory = FileChannel.open(PROCESS_MEMORY)) {
-            int n = dst.remaining();
-            return memory.read(dst, address) == n;
+        try (FileChannel memory = openMemory()) {
+            return readAt(memory, address, dst);
         } catch (IOException | SecurityException unavailable) {
             return false;
         }
@@ -78,8 +99,8 @@ final class NativeMappings {
 
     // Only queried after a leaf could not be decoded on its entry page.
     // A cached snapshot cannot prove the *next* page is still readable.
-    static synchronized int extendCodeWindow(long address, byte[] code, int first) {
-        long[] ranges = cached = parse();
+    static int extendCodeWindow(long address, byte[] code, int first) {
+        long[] ranges = parse();
         int i = containing(ranges, address);
         if (i < 0 || (ranges[i] & EXECUTABLE) == 0) return first;
         int n = bounded(code.length, ranges[i + 1] - address);
@@ -108,7 +129,7 @@ final class NativeMappings {
         if (i < 0 || (ranges[i] & EXECUTABLE) == 0) return 0;
         long start = ranges[i] & ~EXECUTABLE, end = ranges[i + 1], current = address;
         long[] prior = null;
-        try (FileChannel memory = FileChannel.open(PROCESS_MEMORY)) {
+        try (FileChannel memory = openMemory()) {
             ByteBuffer dst = ByteBuffer.wrap(code);
             for (int hops = 0; ; hops++) {
                 long target = current + delta;
@@ -124,7 +145,7 @@ final class NativeMappings {
                 n = pageWindow(target, max);
                 if (Long.compareUnsigned(end - target, n) < 0) return 0;
                 dst.clear().limit(n);
-                if (memory.read(dst, target) != n) return 0;
+                if (!readAt(memory, target, dst)) return 0;
                 int next = directJumpLength(code, n);
                 if (next == 0) return target;
                 if (prior == null) prior = new long[2 * MAX_JUMPS];
@@ -166,17 +187,6 @@ final class NativeMappings {
             else return i;
         }
         return -1;
-    }
-
-    private static long[] ranges() {
-        long[] result = cached;
-        if (result == null) {
-            synchronized (NativeMappings.class) {
-                result = cached;
-                if (result == null) cached = result = parse();
-            }
-        }
-        return result;
     }
 
     private static long[] parse() {

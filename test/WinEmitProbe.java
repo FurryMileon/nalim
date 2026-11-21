@@ -9,10 +9,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
- * Emits the Windows-x64 framed adapters for a set of signatures into
- * win_adapter_<name>.bin files so the C harness (win_abi_harness.c) can
- * execute them on Linux against __attribute__((ms_abi)) callees.
- * The callee address is the magic 0xDEADBEEFCAFEBABE, patched by the runner.
+ * Emits Windows-x64 adapters for the Linux execution harness (win_abi_harness.c).
+ * Native callees use ms_abi; naked targets consume the original Java arguments.
+ * The harness patches 0xDEADBEEFCAFEBABE to the address of each callee.
  */
 public class WinEmitProbe {
 
@@ -26,6 +25,10 @@ public class WinEmitProbe {
         AMD64WindowsCallingConvention cc = new AMD64WindowsCallingConvention();
         ByteBuffer buf = ByteBuffer.allocate(1024).order(ByteOrder.nativeOrder());
         cc.emitFramedCall(buf, MAGIC, ret, types, annotations);
+        write(name, buf);
+    }
+
+    static void write(String name, ByteBuffer buf) throws Exception {
         try (FileOutputStream out = new FileOutputStream("win_adapter_" + name + ".bin")) {
             out.write(buf.array(), 0, buf.position());
         }
@@ -60,6 +63,15 @@ public class WinEmitProbe {
         emit("if4", d, i, f, f, f, f);                 // trailing fp on native stack
         emit("shadow", l);                             // callee writes its entire shadow space
         emit("ffll", l, f, f, l, l);                   // r8 must reach r9 before rdx overwrites r8
+
+        // Exercise the direct form even if the actual DLL and JVM code cache
+        // happen to be more than 2 GiB apart during the native-platform test.
+        AMD64WindowsCallingConvention cc = new AMD64WindowsCallingConvention();
+        ByteBuffer direct = ByteBuffer.allocate(64).order(ByteOrder.nativeOrder());
+        int call = cc.emitDirectCallAndNormalize(direct, short.class, new Class<?>[]{i, i, i, i, i, i});
+        direct.putInt(call + 1, direct.position() - (call + 5));
+        cc.emitCall(direct, MAGIC); // local rel32 target: tail-jump to the assembly fixture
+        write("naked_direct", direct);
         Method fields = WinEmitProbe.class.getDeclaredMethod("fields", l, f, Box.class, l, Box.class, d,
                 l, d, f, d, f, d, l, Box.class, f, Box.class, d, f);
         emit("fields", l, fields.getParameterTypes(), fields.getParameterAnnotations());

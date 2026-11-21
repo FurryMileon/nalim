@@ -9,7 +9,7 @@ its transition overhead.
 When Nalim calls a native function:
 
 - the thread does not switch from `in_Java` to `in_native` and back;
-- no memory barrier is involved;
+- there is no JNI transition fence; HotSpot's nmethod entry barrier still runs when required;
 - no JNI handles are created;
 - exception and safepoint checks are omitted;
 - primitive arrays can be accessed directly in the Java heap.
@@ -25,7 +25,7 @@ were [deprecated](https://bugs.openjdk.org/browse/JDK-8233343) in JDK 16 and
 This repository follows the original [apangin/nalim](https://github.com/apangin/nalim)
 design and keeps it usable on current HotSpot releases. The main additions are:
 
-- executable nmethod entry barriers for JDK 21 and newer;
+- executable nmethod entry barriers on x86-64 and AArch64 when requested by HotSpot;
 - conservative x86-64 auto-inlining, direct tail calls and narrow-return bridges;
 - System V and Windows x64 calling-convention fixes;
 - runtime module opening, so normal use does not need a long list of
@@ -35,9 +35,9 @@ design and keeps it usable on current HotSpot releases. The main additions are:
 The jar also contains Fabric metadata and can be shipped as a library mod. It
 does not depend on Fabric API.
 
-The `v2` branch keeps the public linking API from `main`. An `@Link` and
-`@Code` client compiled against the `main` jar runs unchanged with v2 on
-HotSpot 21 and 25. The JVMCI launch requirements below still apply.
+`v2` keeps the public `@Link` and `@Code` API from `main`; clients do not need
+to recompile. It requires a HotSpot build with JVMCI. Stock JDK 26 is the
+last OpenJDK release with that interface.
 
 ### Examples
 
@@ -165,25 +165,26 @@ On Linux x86-64, an exported symbol can also be a direct jump to the actual
 implementation. Nalim follows up to four out-of-window entry jumps (`jmp rel8`
 or `jmp rel32`, optionally after `ENDBR64`) inside the **same read-only executable
 mapping**, then verifies the destination as usual. Speculative target and
-cross-page reads go through procfs during binding, not at call time. Indirect
-dispatch slots are never followed; if verification or the read fails, the
-adapter calls the original symbol. The native text must stay unchanged while linked.
+cross-page and literal reads go through procfs during binding, not at call time.
+Indirect dispatch slots are never followed. If verification or a read fails,
+the adapter calls the original symbol. While a binding is used, its native
+text and any pooled constants must stay unchanged.
 
 A call, indirect branch, EVEX (AVX-512) instruction, `lock`-prefixed atomic
-or unknown encoding stays on the fallback path. RIP-relative loads that
-cannot use the literal pool, and RIP-relative `lea`, can retain their original
-address if it is within rel32 reach; `-Dnalim.norebase=true` disables this.
-On AMD64, that fallback is normally a JVMCI-relocated five-byte `jmp rel32`.
-Nalim retains the old 12-byte `movabs + jmp` sequence when the JVM reports that
-the target is outside the code cache's signed 32-bit reach. Narrow-return
-bridges use a JVMCI-relocated `call rel32` under the same reachability rule.
+or unknown encoding stays on the fallback path. RIP-relative `lea` and loads
+that cannot use an immutable literal pool call the native function instead.
+This preserves updates to native globals without patching callable code.
+On recent AMD64 JVMCI builds the fallback is a five-byte `jmp rel32` (or a
+`call rel32` for a narrow-return bridge) when the target is in range; otherwise
+the adapter uses its full 64-bit address.
 
 AMD64 `boolean`, `byte`, `short` and `char` returns are extended to the Java ABI
 width before control returns to compiled Java. For small verified functions
 with multiple exits, Nalim inserts that extension at every reachable `ret` /
 `rep ret` and adjusts the internal branches and RIP operands. If a short
 branch would no longer fit, the original call bridge is used instead.
-On System V AMD64 that bridge requires register-resident arguments.
+The x86-64 bridge forwards primitive arguments spilled to the stack as well
+as those passed in registers.
 Non-AMD64 narrow native returns are not supported yet.
 
 On Linux AMD64, a small set of complete integer functions and single `int`/`long`
@@ -232,10 +233,10 @@ for correctness and performance comparisons. `-Dnalim.dump=<dir>` writes each
 installed nmethod after relocation to `<dir>/<Class>.<method>.bin`, ready for
 inspection with `objdump -D -b binary -m i386:x86-64`.
 
-On AMD64 with JDK 21+, the installed nmethod begins with HotSpot's executable
-entry barrier. Its exact 32-byte frame and runtime call live on an out-of-line
-slow path; the steady-state path executes only the barrier compare and a normally
-not-taken branch before reaching the Nalim body.
+When HotSpot requests an entry barrier, x86-64 uses a compare and normally
+not-taken branch; only the slow path builds a 32-byte frame. AArch64 loads a
+guard cell relocated by JVMCI. Both execute the barrier before the native body,
+including after the method is rebound.
 
 Rust-side helper (writes args directly in HotSpot's Java calling convention —
 rsi, rdx, rcx, r8, r9 for integer args):
@@ -279,10 +280,11 @@ Gradle writes `build/libs/nalim.jar`; `build.sh` refreshes the root
 
 ### Running
 
-Nalim uses `jdk.internal.vm.ci`. That module must be resolved before application
-classes start loading; a stock JDK 25 or 26 launch without
-`--add-modules=jdk.internal.vm.ci` fails with
-`NoClassDefFoundError: jdk/vm/ci/code/CompiledCode`.
+Nalim uses `jdk.internal.vm.ci`. The module must be present **and** resolved at
+startup. Stock JDK 27 [removed JVMCI](https://bugs.openjdk.org/browse/JDK-8385142);
+Temurin 27 and 28 EA both reject `--add-modules=jdk.internal.vm.ci` with
+`Module jdk.internal.vm.ci not found`. No launch flag can restore a missing module.
+Use a JVMCI-capable JDK (e.g. 25 or 26), or an FFM binding on newer stock JDKs.
 
 #### Flag-free runtime image
 
@@ -302,9 +304,9 @@ $env:JAVA_HOME = "C:\path\to\jdk-25"
 .\nalim-runtime\bin\java.exe -cp "nalim.jar;app.jar" MainClass
 ```
 
-The builders support JDK 21 and newer and refuse to overwrite an existing
-output directory. Pass a path as the first argument to use a name other than
-`nalim-runtime`.
+The builders require a JDK 21 or newer **with JVMCI** and refuse to overwrite
+an existing output directory. Pass a path as the first argument to use a name
+other than `nalim-runtime`.
 
 The image contains all modules from the selected JDK and bakes these startup
 defaults:
@@ -313,7 +315,7 @@ defaults:
 | --- | --- |
 | 21–24 | `-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI`, JVMCI module, module open, native access |
 | 25 | JVMCI module, module open, native access |
-| 26+ | Same as 25, plus `-XX:-UseCodeCacheFlushing` |
+| 26 | Same as 25, plus `-XX:-UseCodeCacheFlushing` |
 
 Runtime images are tied to the JDK vendor/version, OS and CPU architecture used
 to build them. Keep the generated `legal/` directory when redistributing one.
@@ -332,7 +334,7 @@ The minimum JVMCI options are:
 | --- | --- |
 | 21–24 | `-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI --add-modules=jdk.internal.vm.ci` |
 | 25 | `--add-modules=jdk.internal.vm.ci` |
-| 26+ | `--add-modules=jdk.internal.vm.ci`; add `-XX:-UseCodeCacheFlushing` for long-running processes |
+| 26 | `--add-modules=jdk.internal.vm.ci`; add `-XX:-UseCodeCacheFlushing` for long-running processes |
 
 `--enable-native-access=ALL-UNNAMED` is recommended on current JDKs. Without it,
 library loading still works today but emits a restricted-access warning, and a
@@ -427,7 +429,7 @@ JVMs per workload. `rustmi_abi_ns_per_call` is the geometric mean of the median
 times for three `@Link` signatures used by RustMi. These fixtures measure native
 call throughput with small checked bodies, not RustMi's kernels or Minecraft ticks.
 
-The final v2 jar was compared with `28a162d` on a Ryzen AI 9 365 running
+The v2 jar at `1bb4176` was compared with `28a162d` on a Ryzen AI 9 365 running
 Linux x86-64, HotSpot 25.0.5.0.3 and G1. Each workload used six alternating
 JVM pairs pinned to a single Zen 5 core. Columns show medians for each jar.
 
@@ -459,14 +461,14 @@ per jar. The baseline already used **direct** jumps/calls for both wrappers.
 | Subsequent fresh classes (µs/method) | 16.65 | 15.38 |
 | Linking-thread heap allocation (bytes/method) | 5,806 | 2,886 |
 
-The next comparison uses the **first-pass jar** (`784784c9`), not `d367a5e`,
+The next comparison uses the **first-pass jar** from a local benchmark, not `d367a5e`,
 as the baseline. In `BenchLeafCalls`, the same `invokeExact` call sites use
 handles to the linked native methods before, and verified Java equivalents
 after. Each loop consumes changing integers and checks its sum. Nanoseconds
 per element measure loop throughput, not the latency of an isolated FFI
 call. Symbol lookup and intrinsic setup are outside these loops.
 
-| Measurement | First-pass jar | Benchmarked v2 jar (`edbeb0ee`) |
+| Measurement | First-pass jar | Second local v2 jar |
 | --- | ---: | ---: |
 | `raw_add` via static-final handle (ns/element) | 2.5287 | 0.1515 |
 | `raw_abs` via static-final handle (ns/element) | 2.0216 | 0.1535 |
@@ -505,12 +507,8 @@ single loads/stores no FFI can compete with JIT intrinsics: `Unsafe.getLong`
 Panama critical 4.06 ns — keep per-element access in Java and ship batches to
 native kernels.
 
-The per-call cost of the executable JDK 21+ entry barrier was measured at
-~0.01 ns on Zen 4 (`-Dnalim.unsafe.legacybarrier=true` restores the legacy
-never-executed form for measurement; do not use it on JDK 26+ — it forfeits
-cold-flush protection for ~1%). `-Dnalim.legacypad=true` likewise restores the
-old 1-byte-NOP prologue padding; the coalesced wide-NOP default measured
-identical on Zen 4 and simply spends fewer decode slots.
+An earlier Zen 4 measurement put the executable entry barrier at ~0.01 ns per
+call. V2 no longer offers a switch to bypass a barrier required by the JVM.
 
 The same current jar was also compared with
 [Membrane](https://github.com/RelativityMC/MembraneFFI) on JDK 17, the newest
@@ -562,6 +560,12 @@ JniBench.max_nalim      1000  avgt   10  418,057 ± 0,529  ns/op
 - **macOS:** amd64, aarch64
 - **Windows:** amd64
 
+The [platform workflow](.github/workflows/platforms.yml) exercises the shipped
+jar and a source build on each platform with JDK 21, 25 and 26. To run the same
+ABI, GC and rebinding checks locally: `bash test/check-platform.sh nalim.jar`.
+Other CPU/OS pairs are rejected rather than selecting the wrong machine code.
+In particular, RISC-V and Windows on Arm are not supported.
+
 ### Limitations
 
 A native function linked with Nalim has several constraints compared with a
@@ -573,6 +577,9 @@ regular JNI function:
    objects containing primitive fields.
 4. It must return quickly because the call prevents the JVM from reaching a
    safepoint.
+5. A normal native target must have a fixed C prototype. For variadic APIs,
+   provide a typed native wrapper. `naked = true` instead expects HotSpot's
+   Java calling convention for that OS and CPU.
 
-Due to JVMCI limitations in HotSpot, Nalim works with Parallel, Serial and G1,
-and with ZGC on JDK 21 and newer.
+GC support also depends on the JVMCI build. The platform test runs G1 and,
+where available, ZGC. Older HotSpot releases also support Serial and Parallel.

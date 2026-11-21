@@ -1,0 +1,96 @@
+name: Native platforms
+
+on:
+  push:
+    branches: [v2]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-platforms-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  platform:
+    name: ${{ matrix.os }} / JDK ${{ matrix.java }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15, windows-2022]
+        java: ['21', '25', '26']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - name: Identify host CPU
+        run: |
+          uname -sm
+          case "$RUNNER_OS" in
+            Linux) lscpu | grep -E 'Architecture:|Vendor ID:|Model name:' ;;
+            macOS) sysctl -n machdep.cpu.brand_string ;;
+            Windows) powershell -NoProfile -NonInteractive -Command 'Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name' ;;
+          esac
+      - name: Run shipped jar on the native ABI
+        run: bash test/check-platform.sh nalim.jar
+      - name: Build sources and run on the native ABI
+        run: bash test/check-platform.sh
+      - name: Exercise Win64 emitter against Linux ms_abi callees
+        if: matrix.os == 'ubuntu-24.04' && matrix.java == '25'
+        working-directory: ${{ runner.temp }}
+        run: |
+          javac -cp "$GITHUB_WORKSPACE/nalim.jar" -d . "$GITHUB_WORKSPACE/test/WinEmitProbe.java"
+          java --add-modules=jdk.internal.vm.ci \
+            --add-exports=jdk.internal.vm.ci/jdk.vm.ci.runtime=ALL-UNNAMED \
+            --add-exports=jdk.internal.vm.ci/jdk.vm.ci.meta=ALL-UNNAMED \
+            -cp "$GITHUB_WORKSPACE/nalim.jar:." one.nalim.WinEmitProbe
+          gcc -O1 -o win_abi_harness "$GITHUB_WORKSPACE/test/win_abi_harness.c"
+          ./win_abi_harness
+
+  legacy-client:
+    name: Linux x64 / JDK ${{ matrix.java }} native fallback
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        java: ['11', '17']
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - run: |
+          javac -cp nalim.jar -d "$RUNNER_TEMP" test/SmokeTest.java
+          timeout 30 java -XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI \
+            --add-modules=jdk.internal.vm.ci --add-opens=java.base/java.lang=ALL-UNNAMED \
+            -cp "nalim.jar:$RUNNER_TEMP" SmokeTest
+
+  stock-27:
+    name: JDK 27 without JVMCI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '27'
+      - name: Reject an unusable runtime image before invoking jlink
+        run: |
+          if sh build-runtime.sh "$RUNNER_TEMP/unsupported" > builder.log 2>&1; then exit 1; fi
+          grep -F 'does not contain jdk.internal.vm.ci' builder.log
+          test ! -e "$RUNNER_TEMP/unsupported"

@@ -66,23 +66,24 @@ public class Linker {
     private static final JVMCIBackend jvmci = JVMCI.getRuntime().getHostJVMCIBackend();
     private static final CodeCacheProvider codeCache = jvmci.getCodeCache();
     private static final ConcurrentHashMap<String, Boolean> nativeLibraries = new ConcurrentHashMap<>();
-    private static final CallingConvention callingConvention = CallingConvention.getInstance();
-    private static final String ARCH = System.getProperty("os.arch", "");
-    private static final boolean AMD64 = ARCH.equalsIgnoreCase("amd64") || ARCH.equalsIgnoreCase("x86_64");
-    private static final boolean SYSV_AMD64 = AMD64 && "Linux".equals(System.getProperty("os.name"));
+    private static final String OS = System.getProperty("os.name");
+    private static final CallingConvention callingConvention =
+            CallingConvention.forTarget(codeCache.getTarget().arch.getName(), OS);
+    private static final boolean AMD64 = callingConvention instanceof AMD64CallingConvention;
+    private static final boolean LINUX_AMD64 = callingConvention instanceof AMD64LinuxCallingConvention && OS.equals("Linux");
 
-    // JDK 21+ requires every installed nmethod to carry an entry barrier
-    // (Loom / JEP 444 made BarrierSetNMethod mandatory for every GC). The
-    // values are queried from HotSpotVMConfigAccess so we track any future
-    // reshuffling of the enum in jvmciCodeInstaller.hpp.
-    // On JDK ≤ 20 the constants are absent — lookupMarkId returns null and
-    // we install with the legacy empty-Site[] form.
+    // Query the running JVMCI installer: feature-version checks alone miss
+    // vendor backports. Older installers do not export the entry-patch mark.
     private static final Integer MARK_FRAME_COMPLETE = lookupMarkId("CodeInstaller::FRAME_COMPLETE");
     private static final Integer MARK_ENTRY_BARRIER_PATCH = lookupMarkId("CodeInstaller::ENTRY_BARRIER_PATCH");
     private static final Integer THREAD_DISARMED_OFFSET = lookupConfigField(
             "CompilerToVM::Data::thread_disarmed_guard_value_offset", Integer.class, "int");
     private static final Long NMETHOD_ENTRY_BARRIER = lookupConfigField(
             "CompilerToVM::Data::nmethod_entry_barrier", Long.class, "address");
+    private static final AArch64EntryBarrier ARM_BARRIER =
+            MARK_ENTRY_BARRIER_PATCH != null && callingConvention instanceof AArch64CallingConvention
+            ? new AArch64EntryBarrier(new HotSpotVMConfigAccess(HotSpotJVMCIRuntime.runtime().getConfigStore()),
+                    MARK_ENTRY_BARRIER_PATCH, MARK_FRAME_COMPLETE) : null;
 
     // Alignment of installed nmethod entries; limits how strongly a literal in
     // the inline pool can be aligned. 32 by default on AMD64, but the flag is
@@ -126,12 +127,11 @@ public class Linker {
         // call findAddress before the first thread's System.load has finished.
         if (nativeLibraries.putIfAbsent(name, Boolean.TRUE) == null) {
             try {
-                if (name.indexOf('/') >= 0 || name.indexOf('\\') > 0) {
+                if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0) {
                     System.load(name);
                 } else {
                     System.loadLibrary(name);
                 }
-                NativeMappings.invalidate();
             } catch (RuntimeException | Error t) {
                 // A failed first attempt must not poison the deduplication map;
                 // callers may fix java.library.path / extract the binary and retry.
@@ -157,7 +157,7 @@ public class Linker {
     public static Optional<MethodHandle> findIntrinsic(String symbol, MethodType type) {
         Objects.requireNonNull(symbol, "symbol");
         Objects.requireNonNull(type, "type");
-        if (!SYSV_AMD64 || NO_INLINE) return Optional.empty();
+        if (!LINUX_AMD64 || NO_INLINE) return Optional.empty();
         Class<?> result = type.returnType();
         int n = type.parameterCount();
         if ((result != int.class && result != long.class) || (n != 1 && n != 2)) return Optional.empty();
@@ -180,7 +180,7 @@ public class Linker {
 
         Method[] methods = c.getDeclaredMethods();
         boolean reuseAdapters = false;
-        if (SYSV_AMD64) {
+        if (LINUX_AMD64) {
             int nativeMethods = 0;
             for (Method m : methods) {
                 if (Modifier.isNative(m.getModifiers()) && ++nativeMethods == 2) {
@@ -247,19 +247,13 @@ public class Linker {
 
         Class<?> returnType = m.getReturnType();
         boolean normalizeReturn = CallingConvention.needsReturnNormalization(returnType);
-        // Java-ABI bodies have no shuffle. Only narrow return bridges need to
-        // inspect their parameters, since spilling across the nested call is unsupported.
+        // Java-ABI tail jumps need no signature metadata. A narrow-return
+        // bridge inspects the types to forward the caller's stack arguments.
         Class<?>[] types = !naked || normalizeReturn ? m.getParameterTypes() : null;
         boolean framed = !naked && callingConvention.requiresFramedCall(types);
-        boolean pendingScalarShuffle = SYSV_AMD64 && !naked && !framed && !NO_INLINE
+        boolean pendingScalarShuffle = LINUX_AMD64 && !naked && !framed && !NO_INLINE
                 && AMD64ScalarLeaf.accepts(returnType, types);
-        // 128 bytes covers the entry barrier, six disp32 LEAs and the largest
-        // frameless fallback. Reserve Win64 stack marshalling separately: up to
-        // 8 bytes to load a spill, 7 for a field LEA, 8 for the outgoing store.
-        ByteBuffer buf = reusable == null
-                ? ByteBuffer.allocate(framed ? 160 + 24 * Math.max(0, types.length - 4) : SMALL_ADAPTER_CAPACITY)
-                            .order(ByteOrder.nativeOrder())
-                : reusable.clear();
+        ByteBuffer buf = reusable == null ? newAdapterBuffer(framed, naked, types) : reusable.clear();
         emitEntryBarrierPrologue(buf);
         int shuffleStart = buf.position();
 
@@ -294,9 +288,9 @@ public class Linker {
             if (AMD64 && !NO_INLINE) {
                 if (scratch == null) scratch = new InlineScratch();
                 ByteBuffer inline = tryInlineSmallFunction(buf, address, symbol, returnType, scratch,
-                        !naked && SYSV_AMD64 ? shuffleStart : -1, types, pendingScalarShuffle);
+                        !naked && LINUX_AMD64 ? shuffleStart : -1, types, pendingScalarShuffle);
                 if (inline != null) {
-                    installCode(m, inline, null, scratch.rebases, inline == reusable);
+                    installCode(m, inline, null, inline == reusable);
                     return scratch;
                 }
             }
@@ -313,8 +307,21 @@ public class Linker {
             }
         }
 
-        installCode(m, buf, directJump, null, buf == reusable);
+        installCode(m, buf, directJump, buf == reusable);
         return scratch;
+    }
+
+    private static ByteBuffer newAdapterBuffer(boolean framed, boolean naked, Class<?>[] types) {
+        int capacity = SMALL_ADAPTER_CAPACITY;
+        if (framed) {
+            // Win64: load a spill, adjust a field address and store the outgoing argument.
+            capacity = 160 + 24 * Math.max(0, types.length - 4);
+        } else if (callingConvention instanceof AArch64CallingConvention) {
+            AArch64CallingConvention arm = (AArch64CallingConvention) callingConvention;
+            // Four immediate loads and BR for an arbitrary 64-bit native address.
+            capacity = arm.shuffleCapacity(naked ? 0 : types.length) + 20 + AArch64EntryBarrier.MAX_BYTES;
+        }
+        return ByteBuffer.allocate(capacity).order(ByteOrder.nativeOrder());
     }
 
     // The old AMD64 fallback is `movabs rax, address; jmp rax` (12 bytes and
@@ -322,7 +329,10 @@ public class Linker {
     // signed rel32 of the target, let JVMCI relocate a five-byte `jmp rel32`.
     // CodeCacheProvider performs the ASLR-aware reachability calculation and
     // CodeInstaller patches the displacement only after placing the nmethod.
-    private static final boolean NO_DIRECT_JUMP = Boolean.getBoolean("nalim.nodirect");
+    // On HotSpot 11u an otherwise reachable foreign JMP can be installed
+    // as a jump to itself. Use absolute native addresses on pre-17 JVMCI.
+    private static final boolean NO_DIRECT_JUMP = Runtime.version().feature() < 17
+            || Boolean.getBoolean("nalim.nodirect");
     private static volatile int directJumpMethods;
 
     public static int getDirectJumpMethodCount() {
@@ -410,10 +420,6 @@ public class Linker {
     // Safety valve: -Dnalim.noinline=true forces the tail-call stub for every
     // method (auto-inline off) without code changes. Useful to bisect issues.
     private static final boolean NO_INLINE = Boolean.getBoolean("nalim.noinline");
-    // Safety valve for the rebase relocation only (RIP operands re-aimed at
-    // their original target after install): -Dnalim.norebase=true falls back
-    // to the tail-call stub for bodies that would need it.
-    private static final boolean NO_REBASE = Boolean.getBoolean("nalim.norebase");
 
     // Diagnostics only (linking is effectively single-threaded).
     private static volatile int inlinedMethods;
@@ -432,7 +438,6 @@ public class Linker {
         byte[] queue;
         Insn insn;
         Fixups literals;
-        Fixups rebases;
     }
 
     private static final class Fixups {
@@ -474,8 +479,6 @@ public class Linker {
                 else callingConvention.javaToNative(buf, types, null); // exact primitive signature
             }
             if (leaf != null || AMD64MemoryLeaf.tryEmit(buf, shuffleStart, scratch.code, window, returnType, types)) {
-                // Unlike the general CFG path, this body has no relocations.
-                if (scratch.rebases != null) scratch.rebases.count = 0;
                 inlinedMethods++;
                 if (TRACE_INLINE) System.out.printf("[nalim] %s: inlined %dB Java-ABI leaf%n", symbol, buf.position() - shuffleStart);
                 return buf;
@@ -502,13 +505,13 @@ public class Linker {
                                               Class<?> returnType, InlineScratch scratch, int window,
                                               boolean splitEligible) {
         byte[] code = scratch.code;
+        NativeMappings literalMappings = null; // never shared with a later binding
 
         // ── pass 1: decode and validate ─────────────────────────────────
         Insn insn = scratch.insn;
         if (insn == null) scratch.insn = insn = new Insn();
-        Fixups literals = scratch.literals, rebases = scratch.rebases;
+        Fixups literals = scratch.literals;
         if (literals != null) literals.count = 0;
-        if (rebases != null) rebases.count = 0;
         int end = 0;
         int instructions = 0;
         boolean hasBranch = false;
@@ -608,7 +611,7 @@ public class Linker {
                 end = Math.max(end, i + length);
                 instructions++;
 
-                if (!terminator && insn.ripDispOff >= 0 && !isRipNop(code, i)) {
+                if (!terminator && insn.ripDispOff >= 0) {
                     int dispPos = i + insn.ripDispOff;
                     int disp = (code[dispPos] & 0xFF)
                             | (code[dispPos + 1] & 0xFF) << 8
@@ -616,40 +619,13 @@ public class Linker {
                             | (code[dispPos + 3] & 0xFF) << 24;
                     long operand = address + i + insn.length + disp;
 
-                    // Preferred: copy a small read-only literal into a pool
-                    // inside the nmethod (cache-local, placement-independent).
-                    // Requires alignment no stricter than the installed entry.
-                    if (insn.ripLoadSize > 0
-                            && (literals == null || literals.count < MAX_RELOCATIONS)
-                            && Math.min(insn.ripLoadSize, 32) <= CODE_ENTRY_ALIGNMENT
-                            && NativeMappings.isReadOnlyRange(operand, insn.ripLoadSize)) {
-                        if (literals == null) scratch.literals = literals = new Fixups();
-                        literals.add(operand, dispPos, i + length, insn.ripLoadSize);
-                    } else {
-                        // Rebase: keep the instruction aimed at its ORIGINAL
-                        // operand — the disp32 is rewritten after the nmethod
-                        // is placed. Covers RIP-lea (mutable table bases) and
-                        // loads whose literal is not poolable. Gate: the
-                        // operand must be rel32-reachable from any possible
-                        // nmethod placement (same test as direct jumps).
-                        if (NO_REBASE || (rebases != null && rebases.count == MAX_RELOCATIONS)) {
-                            if (TRACE_INLINE) {
-                                System.out.printf("[nalim] %s: RIP operand at +0x%x needs rebase (%s)%n",
-                                        symbol, i, NO_REBASE ? "disabled" : "slots exhausted");
-                            }
-                            return null;
-                        }
-                        long maxOffset = codeCache.getMaxCallTargetOffset(operand);
-                        if (maxOffset < 0 || maxOffset > Integer.MAX_VALUE) {
-                            if (TRACE_INLINE) {
-                                System.out.printf("[nalim] %s: RIP operand at +0x%x beyond rel32 reach%n",
-                                        symbol, i);
-                            }
-                            return null;
-                        }
-                        if (rebases == null) scratch.rebases = rebases = new Fixups();
-                        rebases.add(operand, dispPos, i + length, 0);
-                    }
+                    // Pool only immutable loads; all other live operands belong to the native body.
+                    if ((literals != null && literals.count == MAX_RELOCATIONS)
+                            || Math.min(insn.ripLoadSize, 32) > CODE_ENTRY_ALIGNMENT) return null;
+                    if (literalMappings == null) literalMappings = NativeMappings.snapshot();
+                    if (!literalMappings.isReadOnlyRange(operand, insn.ripLoadSize)) return null;
+                    if (literals == null) scratch.literals = literals = new Fixups();
+                    literals.add(operand, dispPos, i + length, insn.ripLoadSize);
                 }
 
                 if (branch) {
@@ -715,39 +691,30 @@ public class Linker {
         } else {
             buf.put(code, 0, end);
         }
-        if (literalCount != 0) literals.place(bodyStart, offsets);
-        for (int r = 0; r < literalCount; r++) {
-            // Preserve alignment required by MOVAPS/MOVAPD/MOVDQA (and their
-            // 32-byte VEX forms). The installed entry is CodeEntryAlignment-
-            // aligned (32 by default on AMD64), so a buffer offset aligned to
-            // min(litSize, 32) stays aligned after the nmethod is placed;
-            // larger requirements were rejected during the decode pass.
-            int size = literals.size[r];
-            int alignment = Math.min(size, 32);
-            while ((buf.position() & (alignment - 1)) != 0) {
-                buf.put((byte) 0);
+        if (literalCount != 0) {
+            literals.place(bodyStart, offsets);
+            try (var memory = NativeMappings.openMemory()) {
+                for (int r = 0; r < literalCount; r++) {
+                    // The installed entry alignment was checked in pass 1.
+                    int size = literals.size[r], alignment = Math.min(size, 32);
+                    while ((buf.position() & (alignment - 1)) != 0) buf.put((byte) 0);
+                    int pool = buf.position();
+                    if (!NativeMappings.readLiteral(memory, literals.target[r], buf, size)) {
+                        buf.position(preambleEnd); // fallback must not execute any of this body
+                        return null;
+                    }
+                    buf.putInt(literals.disp[r], pool - literals.next[r]);
+                }
+            } catch (java.io.IOException | SecurityException unavailable) {
+                buf.position(preambleEnd);
+                return null;
             }
-            int pool = buf.position();
-            NativeMemory.copyToArray(literals.target[r], buf.array(), pool, size);
-            buf.position(pool + size);
-            // disp32 := pool − RIP, RIP = address of the next instruction.
-            // Both live in the same nmethod, so the distance survives install.
-            buf.putInt(literals.disp[r], pool - literals.next[r]);
         }
-        int rebaseCount = rebases == null ? 0 : rebases.count;
-        if (rebaseCount != 0) rebases.place(bodyStart, offsets);
-        for (int r = 0; r < rebaseCount; r++) {
-            // Placeholder 0 until the post-install patch: a stray execution in
-            // the tiny install-to-patch window reads the nmethod's own bytes
-            // instead of faulting on an unmapped address.
-            buf.putInt(rebases.disp[r], 0);
-        }
-
         inlinedMethods++;
         if (TRACE_INLINE) {
             System.out.printf(
-                    "[nalim] %s: inlined %dB body, %d literal(s), %d rebase(s)%n",
-                    symbol, buf.position() - bodyStart, literalCount, rebaseCount);
+                    "[nalim] %s: inlined %dB body, %d literal(s)%n",
+                    symbol, buf.position() - bodyStart, literalCount);
         }
         return buf;
     }
@@ -1082,12 +1049,8 @@ public class Linker {
                 case 0x63:                                       // movsxd r64, r/m32
                     loadSize = 4; ripAllowed = true; break;
                 case 0x8D:                                       // lea — memory form only
-                    // RIP form (lea r, [rip+disp]) materializes an address —
-                    // compilers use it for table bases. Accepted with
-                    // loadSize 0: the operand is never dereferenced here, and
-                    // the disp32 is re-aimed at the original target after the
-                    // nmethod is placed (rebase relocation).
-                    regAllowed = false; absOk = true; ripAllowed = true; break;
+                    // RIP-relative LEA materializes the original address; copying a literal cannot preserve it.
+                    regAllowed = false; absOk = true; break;
                 case 0x69:                                       // imul r, r/m, imm32
                     imm = 4; loadSize = w ? 8 : 4; ripAllowed = true; break;
                 case 0x6B:                                       // imul r, r/m, imm8
@@ -1501,8 +1464,11 @@ public class Linker {
             if (!memAllowed) return false;
             if (mod == 0 && rm == 5) {                           // RIP-relative
                 if (!ripAllowed) return false;
-                out.ripDispOff = (mrPos + 1) - off;
-                out.ripLoadSize = loadSize;
+                // A RIP-form NOP is the only allowed zero-width operand; copy its disp32 verbatim.
+                if (loadSize != 0) {
+                    out.ripDispOff = (mrPos + 1) - off;
+                    out.ripLoadSize = loadSize;
+                }
                 tail = 5;
             } else if (rm == 4) {                                // SIB byte
                 int sib = u(code, mrPos + 1, limit);
@@ -1550,15 +1516,14 @@ public class Linker {
         ByteBuffer buf = rawCodeBuffer(HexCode.decodedLength(hex));
         emitEntryBarrierPrologue(buf);
         HexCode.emit(buf, hex);
-        installCode(m, buf, null, null, false);
+        installCode(m, buf, null, false);
     }
 
     private static ByteBuffer rawCodeBuffer(int length) {
-        // AMD64's 22-byte entry + 24-byte slow path also covers legacy trailers.
-        // Leave headroom for JVMCI's signed, word-aligned code size, as before.
-        if (length > Integer.MAX_VALUE - 96) throw new IllegalArgumentException("Machine code too large for JVMCI");
-        return ByteBuffer.allocate(MARK_ENTRY_BARRIER_PATCH == null ? length : length + 46)
-                .order(ByteOrder.nativeOrder());
+        // AMD64's 22-byte entry + 24-byte slow path also covers its legacy trailer.
+        int extra = ARM_BARRIER != null ? AArch64EntryBarrier.MAX_BYTES : MARK_ENTRY_BARRIER_PATCH != null ? 46 : 0;
+        if (length > Integer.MAX_VALUE - extra - 50) throw new IllegalArgumentException("Machine code too large for JVMCI");
+        return ByteBuffer.allocate(length + extra).order(ByteOrder.nativeOrder());
     }
 
     public static void installCode(Method m, byte[] code) {
@@ -1571,7 +1536,7 @@ public class Linker {
         ByteBuffer buf = rawCodeBuffer(length);
         emitEntryBarrierPrologue(buf);
         buf.put(code, 0, length);
-        installCode(m, buf, null, null, false);
+        installCode(m, buf, null, false);
     }
 
     // All executable AMD64 entry barriers have the same prefix. Only the
@@ -1580,17 +1545,15 @@ public class Linker {
     private static final int AMD64_ENTRY_BRANCH_DISP = AMD64_ENTRY_PATCH_OFFSET + 8 + 2; // CMP, JNE opcode
     private static final int AMD64_ENTRY_CONTINUATION = AMD64_ENTRY_BRANCH_DISP + 4;
 
-    // EXPERIMENTAL, measurement only: -Dnalim.unsafe.legacybarrier=true drops
-    // the executable AMD64 entry-barrier prologue and installs the legacy
-    // never-executed trailing barrier instead (the pre-JDK-26 form). Saves the
-    // per-call CMP+JNE but forfeits cold-flush protection on JDK 26+ and any
-    // future GC that relies on nmethod entry barriers actually executing.
-    private static final boolean LEGACY_BARRIER = Boolean.getBoolean("nalim.unsafe.legacybarrier");
-    private static final boolean EXECUTABLE_AMD64_BARRIER = MARK_ENTRY_BARRIER_PATCH != null && AMD64 && !LEGACY_BARRIER;
+    private static final boolean EXECUTABLE_AMD64_BARRIER = MARK_ENTRY_BARRIER_PATCH != null && AMD64;
     private static final Mark AMD64_ENTRY_PATCH = EXECUTABLE_AMD64_BARRIER
             ? new Mark(AMD64_ENTRY_PATCH_OFFSET, MARK_ENTRY_BARRIER_PATCH) : null;
 
     private static void emitEntryBarrierPrologue(ByteBuffer buf) {
+        if (ARM_BARRIER != null) {
+            ARM_BARRIER.emitEntry(buf);
+            return;
+        }
         if (!EXECUTABLE_AMD64_BARRIER) return;
         if (buf.position() != 0) {
             throw new IllegalStateException("AMD64 entry barrier must be the first instruction");
@@ -1664,35 +1627,17 @@ public class Linker {
     private static final DataPatch[] NO_PATCHES = new DataPatch[0];
     private static final byte[] NO_DATA = new byte[0];
 
-    private static void installCode(Method m, ByteBuffer buf, Call directJump, Fixups rebases, boolean sharedBuffer) {
+    private static void installCode(Method m, ByteBuffer buf, Call directJump, boolean sharedBuffer) {
         Site[] sites;
         int totalFrameSize = 0;
-        if (EXECUTABLE_AMD64_BARRIER) {
+        if (ARM_BARRIER != null) {
+            sites = ARM_BARRIER.finish(buf, directJump);
+            totalFrameSize = AArch64EntryBarrier.FRAME_SIZE;
+        } else if (EXECUTABLE_AMD64_BARRIER) {
             sites = finishEntryBarrier(buf, directJump);
             totalFrameSize = 32; // return address + saved rbp + 16-byte aligned slow frame
-        } else if (MARK_ENTRY_BARRIER_PATCH != null) {
-            int markOffset = callingConvention.emitNMethodBarrier(buf);
-            // Emit both FRAME_COMPLETE (id=6) and ENTRY_BARRIER_PATCH (id=7)
-            // at the barrier offset, matching the canonical form used by Graal
-            // and OpenJDK's JTreg AMD64TestAssembler.emitNMethodEntryBarrier.
-            if (MARK_FRAME_COMPLETE != null) {
-                sites = directJump != null
-                        ? new Site[] {
-                                directJump,
-                                new Mark(markOffset, MARK_FRAME_COMPLETE),
-                                new Mark(markOffset, MARK_ENTRY_BARRIER_PATCH)
-                        }
-                        : new Site[] {
-                                new Mark(markOffset, MARK_FRAME_COMPLETE),
-                                new Mark(markOffset, MARK_ENTRY_BARRIER_PATCH)
-                        };
-            } else {
-                sites = directJump != null
-                        ? new Site[] { directJump, new Mark(markOffset, MARK_ENTRY_BARRIER_PATCH) }
-                        : new Site[] { new Mark(markOffset, MARK_ENTRY_BARRIER_PATCH) };
-            }
         } else {
-            // Pre-Loom JDK — installCode0 does not require an entry barrier.
+            // This JVMCI installer does not require an entry barrier.
             sites = directJump != null ? new Site[] { directJump } : NO_SITES;
         }
 
@@ -1712,10 +1657,10 @@ public class Linker {
                 NO_ASSUMPTIONS,
                 new ResolvedJavaMethod[] { rm },
                 NO_COMMENTS,
-                NO_DATA,
-                1,
+                ARM_BARRIER != null ? new byte[AArch64EntryBarrier.GUARD_SIZE] : NO_DATA,
+                ARM_BARRIER != null ? AArch64EntryBarrier.GUARD_SIZE : 1,
                 NO_PATCHES,
-                true,
+                ARM_BARRIER == null,
                 totalFrameSize,
                 null,
                 rm,
@@ -1728,108 +1673,9 @@ public class Linker {
         InstalledCode installed = codeCache.setDefaultCode(rm, nm);
         rm.setNotInlinableOrCompilable();
 
-        applyRebaseRelocations(m, buf, installed, rebases);
-
         if (DUMP_DIR != null) {
             dumpInstalledCode(m, installed);
         }
-    }
-
-    /**
-     * Re-aim RIP-relative disp32 fields recorded by the inliner at their
-     * original operands, now that the nmethod address is known. Entries are
-     * {bufOffsetOfDisp32, bufOffsetOfNextInsn, absoluteTargetAddress}.
-     * <p>
-     * Assumes the installed instructions are a byte-identical copy of the
-     * buffer starting at {@link InstalledCode#getStart()} — verified against
-     * the surrounding instruction bytes BEFORE anything is written (bytes
-     * belonging to any rebase disp32 field are excluded from the check, so
-     * adjacent rebased instructions cannot fail against each other's patch).
-     * Reachability was pre-gated with {@code getMaxCallTargetOffset}, so the
-     * final displacement always fits. On any inconsistency the nmethod is
-     * invalidated before throwing — a stale placeholder must never stay
-     * callable.
-     * <p>
-     * Contract: linkMethod must complete before the method is invoked from
-     * another thread. Link inside the holder class's static initializer (the
-     * JVM serializes class init) — otherwise a racing caller could execute
-     * the body while displacements still hold the placeholder value.
-     */
-    private static void applyRebaseRelocations(
-            Method m, ByteBuffer buf, InstalledCode installed, Fixups rebases) {
-        if (rebases == null || rebases.count == 0) {
-            return;
-        }
-        try {
-            long start = installed.getStart();
-            if (start == 0) {
-                throw new IllegalStateException("nalim: no code address after install: " + m);
-            }
-            // Pass 1: verify the installed image mirrors the buffer around
-            // every disp field, skipping bytes inside ANY recorded disp field.
-            for (int r = 0; r < rebases.count; r++) {
-                int dispOff = rebases.disp[r];
-                for (int k = -4; k < 8; k++) {
-                    int p = dispOff + k;
-                    if (p < 0 || p >= buf.position() || insideRebaseField(p, rebases)) {
-                        continue;
-                    }
-                    if (NativeMemory.unsafe.getByte(start + p) != buf.get(p)) {
-                        throw new IllegalStateException(
-                                "nalim: installed code does not mirror the buffer at +0x"
-                                        + Integer.toHexString(p) + ": " + m);
-                    }
-                }
-            }
-            // Pass 2: range-check every displacement, then write them all.
-            for (int r = 0; r < rebases.count; r++) {
-                long disp = rebases.target[r] - (start + rebases.next[r]);
-                if (disp < Integer.MIN_VALUE || disp > Integer.MAX_VALUE) {
-                    throw new IllegalStateException(
-                            "nalim: rebase target out of rel32 range: " + m);
-                }
-            }
-            for (int r = 0; r < rebases.count; r++) {
-                NativeMemory.unsafe.putInt(start + rebases.disp[r],
-                        (int) (rebases.target[r] - (start + rebases.next[r])));
-            }
-        } catch (Throwable t) {
-            // The nmethod is already the method's default code; never leave a
-            // placeholder displacement callable.
-            try {
-                installed.invalidate();
-            } catch (Throwable suppressed) {
-                // invalidation is best-effort; the original failure wins
-            }
-            throw t;
-        }
-    }
-
-    // Multi-byte NOP (0F 1F /0) with a RIP-form operand: the operand is never
-    // accessed, so the stale disp32 may be copied verbatim — relocating it
-    // would waste rebase slots and could veto inlining on reachability.
-    private static boolean isRipNop(byte[] code, int off) {
-        int j = off;
-        while (j < code.length - 1) {
-            int b = code[j] & 0xFF;
-            if (b == 0x66 || b == 0x2E || b == 0x3E || (b & 0xF0) == 0x40) {
-                j++;
-            } else {
-                break;
-            }
-        }
-        return j < code.length - 1
-                && (code[j] & 0xFF) == 0x0F && (code[j + 1] & 0xFF) == 0x1F;
-    }
-
-    private static boolean insideRebaseField(int p, Fixups rebases) {
-        for (int r = 0; r < rebases.count; r++) {
-            int off = rebases.disp[r];
-            if (p >= off && p < off + 4) {
-                return true;
-            }
-        }
-        return false;
     }
 
     // Diagnostics: -Dnalim.dump=<dir> writes every installed nmethod body

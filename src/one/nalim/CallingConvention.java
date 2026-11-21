@@ -28,26 +28,16 @@ import java.nio.ByteBuffer;
 
 abstract class CallingConvention {
 
-    static CallingConvention getInstance() {
-        String arch = System.getProperty("os.arch").toLowerCase();
-        if (!arch.contains("64")) {
-            throw new IllegalStateException("Unsupported architecture: " + arch);
+    static CallingConvention forTarget(String arch, String os) {
+        boolean linux = os.equals("Linux");
+        boolean mac = os.equals("Mac OS X");
+        if (arch.equalsIgnoreCase("amd64") || arch.equalsIgnoreCase("x86_64")) {
+            if (os.startsWith("Windows")) return new AMD64WindowsCallingConvention();
+            if (linux || mac) return new AMD64LinuxCallingConvention();
+        } else if (arch.equalsIgnoreCase("aarch64") && (linux || mac)) {
+            return new AArch64CallingConvention(mac);
         }
-
-        if (arch.contains("aarch") || arch.contains("arm")) {
-            return new AArch64CallingConvention();
-        }
-
-        if (arch.contains("riscv")) {
-            return new RISCV64CallingConvention();
-        }
-
-        String os = System.getProperty("os.name").toLowerCase();
-        if (os.contains("windows")) {
-            return new AMD64WindowsCallingConvention();
-        } else {
-            return new AMD64LinuxCallingConvention();
-        }
+        throw new IllegalStateException("Unsupported native calling convention: " + os + " / " + arch);
     }
 
     abstract void javaToNative(ByteBuffer buf, Class<?>[] types, Annotation[][] annotations);
@@ -129,25 +119,6 @@ abstract class CallingConvention {
             throw new IllegalArgumentException("Not a narrow return type: " + type);
         }
     }
-
-    /**
-     * Append the "no-op" nmethod entry barrier required by JVMCI since JDK 21.
-     * Loom / JEP 444 made {@code BarrierSetNMethod} mandatory for every GC, so
-     * {@code CompilerToVM.installCode0} now rejects any nmethod missing a Mark
-     * with id {@code CodeInstaller::ENTRY_BARRIER_PATCH}.
-     * <p>
-     * The barrier is emitted AFTER the tail-call produced by {@link #emitCall},
-     * so the CPU never executes it; it exists solely to satisfy JVMCI validation.
-     * Implementations must pad to the architectural alignment required for
-     * atomic patching (4 bytes on AMD64 / AArch64 / RISC-V64), emit the canonical
-     * opcode-prefix bytes that HotSpot recognises (see {@code AMD64TestAssembler}
-     * in the OpenJDK JTreg sources), and advance the buffer position past the
-     * barrier.
-     *
-     * @return offset within {@code buf} where the barrier begins —
-     *         caller registers {@code new Mark(returnedOffset, ENTRY_BARRIER_PATCH)}.
-     */
-    abstract int emitNMethodBarrier(ByteBuffer buf);
 
     protected static int baseOffset(Class<?> type, Annotation[] annotations) {
         if (type.isArray() && type.getComponentType().isPrimitive()) {

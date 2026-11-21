@@ -28,6 +28,10 @@ if [ "$feature" -lt 21 ]; then
     echo "The Nalim runtime image requires JDK 21 or newer" >&2
     exit 1
 fi
+if [ ! -f "$module_path/jdk.internal.vm.ci.jmod" ]; then
+    echo "This JDK does not contain jdk.internal.vm.ci; Nalim requires a JVMCI-capable HotSpot build" >&2
+    exit 1
+fi
 if [ -e "$output" ]; then
     echo "Output already exists: $output" >&2
     echo "Remove it explicitly before rebuilding" >&2

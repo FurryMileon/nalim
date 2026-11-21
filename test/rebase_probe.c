@@ -1,6 +1,4 @@
-// Regression probe for the rebase relocation: ADJACENT direct RIP-relative
-// operands into writable .data (static => internal linkage => no GOT), the
-// exact shape that made verify-then-patch self-collide.
+// Adjacent RIP-relative loads from writable globals must observe writes made after linking.
 // gcc -O2 -shared -fPIC -fno-stack-protector -o librebase_probe.so rebase_probe.c
 #include <stdint.h>
 
