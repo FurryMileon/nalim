@@ -35,6 +35,10 @@ design and keeps it usable on current HotSpot releases. The main additions are:
 The jar also contains Fabric metadata and can be shipped as a library mod. It
 does not depend on Fabric API.
 
+The `v2` branch keeps the public linking API from `main`. An `@Link` and
+`@Code` client compiled against the `main` jar runs unchanged with v2 on
+HotSpot 21 and 25. The JVMCI launch requirements below still apply.
+
 ### Examples
 
 #### 1. Basic usage
@@ -422,6 +426,26 @@ It builds the current sources in a temporary directory and measures five pinned
 JVMs per workload. `rustmi_abi_ns_per_call` is the geometric mean of the median
 times for three `@Link` signatures used by RustMi. These fixtures measure native
 call throughput with small checked bodies, not RustMi's kernels or Minecraft ticks.
+
+The final v2 jar was compared with `28a162d` on a Ryzen AI 9 365 running
+Linux x86-64, HotSpot 25.0.5.0.3 and G1. Each workload used six alternating
+JVM pairs pinned to a single Zen 5 core. Columns show medians for each jar.
+
+| Measurement | Before | v2 (`1.2.3-patched-autoinline`) |
+| --- | ---: | ---: |
+| Three-signature ABI geometric mean (ns/call) | 1.969 | 1.819 |
+| Spawn-cap ABI fixture (ns/call) | 1.679 | 1.326 |
+| Eight-integer stack fixture (ns/call) | 2.322 | 2.176 |
+| Fresh three-method class (heap bytes/method) | 2,885 | 2,720 |
+| Repeated `findIntrinsic` resolution (µs/lookup) | 38.48 | 32.97 |
+| Repeated `findIntrinsic` resolution (heap bytes/lookup) | 54,984 | 8,368 |
+
+The hot layout change is enabled only on the measured AMD Strix Point model
+(Zen 5 and Zen 5c). It does not change the HotSpot entry barrier or ABI.
+`findIntrinsic` timings measure symbol resolution and executable mapping
+proofs after JVM warmup, not first startup or invocation of the returned handle.
+
+The earlier results below use different baselines and fixtures.
 
 Linux x86-64, Ryzen AI 9 365, OpenJDK 25.0.5.0.3, G1; median of eight JVMs
 per jar. The baseline already used **direct** jumps/calls for both wrappers.

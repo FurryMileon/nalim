@@ -9,17 +9,17 @@ import java.nio.file.Paths;
 
 /** Hot layout policies for Linux AMD64. Unidentified CPUs keep the generic layout. */
 final class AMD64Dispatch {
-    // A taken jump between the shuffle and a verified leaf helped both Zen 5
-    // and Zen 5c. Do not add a branch by default on unmeasured architectures.
-    static final boolean SPLIT_INLINE_BODY = isZen5Family();
+    // A taken jump helped both core types on the measured Strix Point model.
+    // Family 0x1a alone also covers unmeasured chips; leave them on fall-through.
+    static final boolean SPLIT_INLINE_BODY = isStrixPoint();
 
     private AMD64Dispatch() {
     }
 
-    private static boolean isZen5Family() {
+    private static boolean isStrixPoint() {
         try (BufferedReader info = Files.newBufferedReader(
                 Paths.get("/proc/cpuinfo"), StandardCharsets.ISO_8859_1)) {
-            boolean amd = false, family = false;
+            boolean amd = false, family = false, model = false;
             for (String line; (line = info.readLine()) != null && !line.isEmpty(); ) {
                 int colon = line.indexOf(':');
                 if (colon < 0) continue;
@@ -30,8 +30,11 @@ final class AMD64Dispatch {
                 } else if (field.equals("cpu family")) {
                     if (!line.substring(colon + 1).trim().equals("26")) return false;
                     family = true;
+                } else if (field.equals("model")) {
+                    if (!line.substring(colon + 1).trim().equals("36")) return false;
+                    model = true;
                 }
-                if (amd && family) return true;
+                if (amd && family && model) return true;
             }
         } catch (IOException | SecurityException unavailable) {
             return false;
