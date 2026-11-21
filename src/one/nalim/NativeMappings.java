@@ -14,11 +14,10 @@
 
 package one.nalim;
 
-import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -31,6 +30,7 @@ final class NativeMappings {
     private static final long[] NO_RANGES = new long[0];
     private static volatile long[] cached;
     private static final int MAX_JUMPS = 4;
+    private static final Path PROCESS_MAPPINGS = Paths.get("/proc/self/maps");
     private static final Path PROCESS_MEMORY = Paths.get("/proc/self/mem");
 
     private NativeMappings() {
@@ -176,28 +176,86 @@ final class NativeMappings {
     }
 
     private static long[] parse() {
-        // Only the ASCII address/perms prefix matters. Paths need not be valid UTF-8.
-        try (BufferedReader reader = Files.newBufferedReader(Paths.get("/proc/self/maps"), StandardCharsets.ISO_8859_1)) {
-            long[] result = new long[3 * 128];
-            int used = 0;
-            for (String line; (line = reader.readLine()) != null; ) {
-                int sp = line.indexOf(' ');
-                if (sp < 0 || sp + 3 >= line.length() || line.charAt(sp + 1) != 'r' || line.charAt(sp + 2) != '-') continue;
-                int dash = line.indexOf('-');
-                if (dash <= 0 || dash >= sp) return NO_RANGES;
-                long start = Long.parseUnsignedLong(line, 0, dash, 16);
-                long end = Long.parseUnsignedLong(line, dash + 1, sp, 16);
-                if (Long.compareUnsigned(start, end) >= 0 || (used != 0 && Long.compareUnsigned(start, result[used - 2]) < 0)) {
-                    return NO_RANGES;
-                }
-                if (used == result.length) result = Arrays.copyOf(result, used * 2);
-                result[used++] = start;
-                result[used++] = end;
-                result[used++] = line.charAt(sp + 3) == 'x' ? 1 : 0;
-            }
-            return Arrays.copyOf(result, used);
+        try (InputStream maps = Files.newInputStream(PROCESS_MAPPINGS)) {
+            return readRanges(maps);
         } catch (IOException | SecurityException | NumberFormatException e) {
             return NO_RANGES;
+        }
+    }
+
+    // Two unsigned 64-bit addresses, dash, space and four permission bytes.
+    private static final int MAP_PREFIX_SIZE = 16 + 1 + 16 + 1 + 4;
+
+    private static long[] readRanges(InputStream maps) throws IOException {
+        Ranges ranges = new Ranges();
+        byte[] block = new byte[8192], prefix = null;
+        int pending = 0;
+        for (int size; (size = maps.read(block)) != -1; ) {
+            for (int start = 0; start < size; ) {
+                int end = findByte(block, start, size, '\n');
+                if (pending == 0 && end != size) {
+                    if (!ranges.append(block, start, end)) return NO_RANGES;
+                } else {
+                    // Copy only the prefix of a split line, never the mapping's
+                    // pathname. Unsplit lines are parsed directly in the block.
+                    if (prefix == null) prefix = new byte[MAP_PREFIX_SIZE];
+                    int keep = Math.min(end - start, MAP_PREFIX_SIZE - pending);
+                    if (keep != 0) {
+                        System.arraycopy(block, start, prefix, pending, keep);
+                        pending += keep;
+                    }
+                    if (end != size) {
+                        if (!ranges.append(prefix, 0, pending)) return NO_RANGES;
+                        pending = 0;
+                    }
+                }
+                start = end + 1;
+            }
+        }
+        if (pending != 0 && !ranges.append(prefix, 0, pending)) return NO_RANGES;
+        return Arrays.copyOf(ranges.values, ranges.used);
+    }
+
+    private static int findByte(byte[] bytes, int from, int end, int value) {
+        while (from < end && bytes[from] != value) from++;
+        return from;
+    }
+
+    private static long address(byte[] line, int from, int end) {
+        if (from == end || end - from > 16) throw new NumberFormatException();
+        long address = 0;
+        while (from < end) {
+            int c = line[from++], digit = c - '0';
+            if (digit < 0 || digit > 9) {
+                int alpha = (c | 0x20) - 'a';
+                if (alpha < 0 || alpha > 5) throw new NumberFormatException();
+                digit = alpha + 10;
+            }
+            address = (address << 4) | digit;
+        }
+        return address;
+    }
+
+    private static final class Ranges {
+        long[] values = new long[3 * 128];
+        int used;
+
+        boolean append(byte[] line, int from, int end) {
+            int sp = findByte(line, from, end, ' ');
+            if (sp + 4 >= end || line[sp + 1] != 'r' || line[sp + 2] != '-') return true;
+            int execute = line[sp + 3], sharing = line[sp + 4];
+            if ((execute != '-' && execute != 'x') || (sharing != 'p' && sharing != 's')) return false;
+            int dash = findByte(line, from, sp, '-');
+            if (dash <= from || dash == sp) return false;
+            long start = address(line, from, dash);
+            long finish = address(line, dash + 1, sp);
+            if (Long.compareUnsigned(start, finish) >= 0
+                    || (used != 0 && Long.compareUnsigned(start, values[used - 2]) < 0)) return false;
+            if (used == values.length) values = Arrays.copyOf(values, used * 2);
+            values[used++] = start;
+            values[used++] = finish;
+            values[used++] = execute == 'x' ? 1 : 0;
+            return true;
         }
     }
 }
