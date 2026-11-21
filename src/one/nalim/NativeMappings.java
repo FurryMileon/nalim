@@ -16,7 +16,10 @@ package one.nalim;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -192,7 +195,7 @@ final class NativeMappings {
         int pending = 0;
         for (int size; (size = maps.read(block)) != -1; ) {
             for (int start = 0; start < size; ) {
-                int end = findByte(block, start, size, '\n');
+                int end = Ranges.newline(block, start, size);
                 if (pending == 0 && end != size) {
                     if (!ranges.append(block, start, end)) return NO_RANGES;
                 } else {
@@ -237,8 +240,24 @@ final class NativeMappings {
     }
 
     private static final class Ranges {
+        private static final VarHandle LITTLE_ENDIAN_WORDS =
+                MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
+        private static final long LOW_BITS = 0x7f7f7f7f7f7f7f7fL;
+        private static final long NEWLINES = '\n' * 0x0101010101010101L;
+
         long[] values = new long[3 * 128];
         int used;
+
+        private static int newline(byte[] bytes, int from, int end) {
+            for (; end - from >= Long.BYTES; from += Long.BYTES) {
+                long word = (long) LITTLE_ENDIAN_WORDS.get(bytes, from) ^ NEWLINES;
+                // Adding 0x7f to each low seven-bit lane cannot carry between lanes.
+                // Only originally zero lanes still have a clear high bit.
+                long matches = ~(((word & LOW_BITS) + LOW_BITS) | word) & ~LOW_BITS;
+                if (matches != 0) return from + (Long.numberOfTrailingZeros(matches) >>> 3);
+            }
+            return findByte(bytes, from, end, '\n');
+        }
 
         boolean append(byte[] line, int from, int end) {
             int sp = findByte(line, from, end, ' ');
