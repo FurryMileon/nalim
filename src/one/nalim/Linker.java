@@ -425,7 +425,7 @@ public class Linker {
     private static final byte QUEUED = -2, INTERIOR = -1;
     private static final class InlineScratch {
         final byte[] code = new byte[MAX_INLINE_BYTES];
-        final byte[] lengths = new byte[MAX_INLINE_BYTES];
+        byte[] lengths;
         byte[] queue;
         final Insn insn = new Insn();
         Fixups literals;
@@ -519,7 +519,9 @@ public class Linker {
         // branch into the middle of an instruction is rejected either here (the
         // target is already owned by another offset) or when the target block
         // decodes and collides with owned bytes.
-        byte[] lengths = scratch.lengths, queue = scratch.queue;
+        byte[] lengths = scratch.lengths;
+        if (lengths == null) scratch.lengths = lengths = new byte[MAX_INLINE_BYTES];
+        byte[] queue = scratch.queue;
         Arrays.fill(lengths, 0, window, (byte) 0);
         int head = 0;
         int tail = 0;
