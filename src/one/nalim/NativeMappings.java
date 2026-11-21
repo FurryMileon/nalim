@@ -188,7 +188,7 @@ final class NativeMappings {
 
     static long[] readRanges(InputStream maps) throws IOException {
         Ranges ranges = new Ranges();
-        byte[] block = new byte[8192], prefix = null;
+        byte[] block = new byte[4096], prefix = null;
         int pending = 0;
         for (int size; (size = maps.read(block)) != -1; ) {
             for (int start = 0; start < size; ) {
