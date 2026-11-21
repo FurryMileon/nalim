@@ -1,131 +1,271 @@
-# Nalim v2
+# nalim
 
-Nalim uses HotSpot's JVMCI to link Java methods to short C or Rust functions. It cuts call overhead when Java calls native code in a hot loop. On a Minecraft server, a mod such as RustMi has to use Nalim for it to affect tick time. Installing `nalim.jar` alone won't speed up the server.
+Nalim is a library for linking Java methods to native functions using
+[JVMCI](https://openjdk.org/jeps/243) (the JVM Compiler Interface). It follows
+the original [apangin/nalim](https://github.com/apangin/nalim) design.
 
-**[Download nalim.jar 1.2.5](https://raw.githubusercontent.com/FurryMileon/nalim/84fb642e623218f05c2a04439d5153439e906cef/nalim.jar)** · [Binding and ABI reference for this build](https://github.com/FurryMileon/nalim/blob/84fb642e623218f05c2a04439d5153439e906cef/README.md)
+When Nalim calls a native function, the thread stays in `in_Java`. There is no
+JNI transition fence, no JNI handle allocation, and no exception or safepoint
+check inside the native function. HotSpot's compiled-method entry barrier still
+runs when required. A native function can read or write a primitive array
+directly in the Java heap.
 
-- [Run RustMi with Nalim](#run-rustmi-with-nalim) to enable the backend and check which version the server loaded. No Java changes needed.
-- [Call native code from Java](#call-native-code-from-java) to process an array in one call or let HotSpot inline a small integer function into your loop.
-- [Reproduce the benchmarks](#benchmarks) to see which calls got faster and by how much.
+This works best for short native functions, where the cost of entering JNI
+would otherwise dominate the work. The tradeoff is similar to that of
+[JNI Critical Natives](https://bugs.openjdk.org/browse/JDK-8233343): the
+function must return promptly and must not call back into Java.
 
-## Run RustMi with Nalim
+## What changed in v2?
 
-These instructions are for **Minecraft 26.3 with Fabric and [RustMi](https://github.com/DUzzL/RustMi) on Linux x86-64** (Intel or AMD). Start with HotSpot JDK 25 and its default G1 collector. On other platforms, let RustMi select its backend; it can use the Foreign Function & Memory API (FFM).
+[`main` is the preserved v1 branch](https://github.com/FurryMileon/nalim/tree/main)
+(`1.2.0-patched-autoinline`). The default branch is `v2`
+([download `nalim.jar`, `1.2.5-patched-autoinline`](https://raw.githubusercontent.com/FurryMileon/nalim/84fb642e623218f05c2a04439d5153439e906cef/nalim.jar)).
+Existing `@Link`, `@Library`, `@FieldOffset`, and `@Code` declarations keep
+their signatures. You don't have to rewrite them to upgrade.
 
-1. Stop the server. Keep `rustmi-*.jar` in `mods/`: it already bundles Nalim. If Fabric's mod list shows a version older than `1.2.5-patched-autoinline`, put [the v2 JAR](https://raw.githubusercontent.com/FurryMileon/nalim/84fb642e623218f05c2a04439d5153439e906cef/nalim.jar) in `mods/`. Replace any older standalone copy of Nalim. You don't need to unpack RustMi or add `-javaagent`.
-2. Run this command from the server directory. If you use a hosting panel, put the JVM options **before `-jar`** and keep your existing memory settings. **On JDK 26**, also add `-XX:-UseCodeCacheFlushing` before `-jar`; otherwise RustMi won't select Nalim.
+| Area | v1 | v2 |
+| --- | --- | --- |
+| Short integer functions | `@Link` could copy a native body into its own compiled method. | On Linux x86-64, the new `Linker.findIntrinsic` can return a Java `MethodHandle` that HotSpot can inline **into the caller**. This is opt-in. |
+| Ordinary `@Link` calls | Used an ABI adapter or a verified copy of the native body. | On Linux x86-64, selected scalar operations and single loads/stores can use Java's argument registers directly. Existing call sites pick this up automatically. |
+| Native calling conventions | On x86-64 System V, the narrow-return bridge required register-only arguments. | The bridge also forwards spilled primitive arguments. v2 fixes mixed argument passing on Win64 and AArch64, and emits the entry barrier required by newer AArch64 HotSpot builds. |
+| Runtime images | The builders expected a JDK with a `jmods/` directory. | They also work with linkable JDK images that have JVMCI but don't ship separate JMOD files. |
 
-   ```sh
-   java --add-modules=jdk.internal.vm.ci --add-opens=java.base/java.lang=ALL-UNNAMED --enable-native-access=ALL-UNNAMED -jar fabric-server-launch.jar nogui
-   ```
+See [Upgrading from v1](docs/v2.md) for compatibility limits and a binding
+example, or [Performance](docs/performance.md) for a reproducible comparison
+of both JARs. Auto-inlining and direct tail jumps already existed in v1.
 
-3. Look for **both** lines in `logs/latest.log`. The first tells you which Nalim JAR Fabric loaded. The second tells you whether RustMi is actually using it.
+## Examples
 
-   ```text
-   nalim 1.2.5-patched-autoinline
-   RustMI native backend: Nalim (JVMCI)
-   ```
+### 1. Basic usage
 
-You can also check the backend with `/rustmi stats`. If the log says `FFM (…)`, the reason is in parentheses. To diagnose a failure on a test server with the Linux and JDK setup above, add `-Drustmi.backend=nalim`. RustMi will report the error at startup instead of falling back to FFM. To switch back to FFM, remove the Nalim flags and run the command below. Use this on stock JDK 27 or a JDK 28 EA build without JVMCI as well.
-
-```sh
-java --enable-native-access=ALL-UNNAMED -Drustmi.backend=ffm -jar fabric-server-launch.jar nogui
-```
-
-**Measuring server performance.** Restore the same world snapshot before each run, replay the same workload, and give each server the same warm-up. Alternate the order: A/B, then B/A. To compare Nalim versions, change only the JAR and confirm both runs use `Nalim`. To compare Nalim with FFM, keep the JAR and change only the backend.
-
-On a test copy, `/tick sprint 3000` reports the average time per tick for that run. On a live server, compare median and p95 **milliseconds per tick (MSPT)**. The p95 is the time within which 95% of ticks finish. Two servers can both report 20 TPS even if one needs 5 ms per tick and the other needs 45 ms.
-
-## Call native code from Java
-
-**For arrays, start by making fewer calls.** Pass a small array or a slice to one native function instead of calling a native `load` for each element. For example, [`nalimSumHeap(long[] p, int n)`](test/BenchMemAccess.java) calls [`mem_sum_longs(const int64_t* p, int32_t n)`](test/nalim_mem.c) without copying the array. Load the library and run `Linker.linkClass(...)` once during class initialization. Compare the result with a plain Java loop: Java can be faster when each element needs little work.
-
-Check `p != null` and `0 <= n <= p.length` in Java before calling the function. The native code must not keep the array address after it returns, block, or call back into Java. Use JNI or FFM for long computations, I/O, or callbacks. Match the Java signature to the function's C ABI; in Rust, export the function with `extern "C"`.
-
-**For a short arithmetic function called in a loop**, try `Linker.findIntrinsic` on Linux x86-64. Nalim inspects the compiled function and looks for an exact Java equivalent. The symbol name alone is not enough. It recognizes some functions that take one or two arguments, all `int` or all `long`, and return the same type. If there's a match, HotSpot can inline the Java equivalent into the loop. A plain `@Link` call does not switch to a `MethodHandle` automatically.
-
-This example calls `raw_add` from [`test/nalim_bench.c`](test/nalim_bench.c). Clone v2, then save the class below as `Demo.java` in the `nalim` directory:
-
-```sh
-git clone --branch v2 https://github.com/FurryMileon/nalim.git
-cd nalim
-```
+On Linux or macOS, `getuid()` and `getgid()` are libc functions. `@Link`
+uses the Java method name as the symbol name. Bind the methods once when the
+class is initialized:
 
 ```java
-import java.lang.invoke.MethodHandle;
-import java.lang.invoke.MethodType;
 import one.nalim.Link;
 import one.nalim.Linker;
 
-public final class Demo {
-    @Link(name = "raw_add")
-    private static native int nativeAdd(int x, int y);
+public class Libc {
+    @Link public static native int getuid();
+    @Link public static native int getgid();
 
-    private static final MethodHandle ADD;
     static {
-        Linker.loadLibrary("nalim_bench");
-        ADD = Linker.findIntrinsic("raw_add",
-                MethodType.methodType(int.class, int.class, int.class)).orElse(null);
-        if (ADD == null) Linker.linkClass(Demo.class);
+        Linker.linkClass(Libc.class);
     }
 
-    static int add(int x, int y) throws Throwable {
-        return ADD == null ? nativeAdd(x, y) : (int) ADD.invokeExact(x, y);
-    }
-
-    public static void main(String[] args) throws Throwable {
-        System.out.println((ADD == null ? "@Link" : "intrinsic") + ": " + add(19, 23));
+    public static void main(String[] args) {
+        System.out.println("My user id = " + getuid());
+        System.out.println("My group id = " + getgid());
     }
 }
 ```
 
-From the repository root on **Linux x86-64 with JDK 25** and a C compiler, run:
+Save this as `Libc.java` next to `nalim.jar`. With HotSpot JDK 25:
 
 ```sh
-cc -O2 -shared -fPIC test/nalim_bench.c -o libnalim_bench.so
-javac -cp nalim.jar Demo.java
-java --add-modules=jdk.internal.vm.ci --add-opens=java.base/java.lang=ALL-UNNAMED --enable-native-access=ALL-UNNAMED -Djava.library.path=. -cp nalim.jar:. Demo
+javac -cp nalim.jar Libc.java
+java --add-modules=jdk.internal.vm.ci \
+     --add-opens=java.base/java.lang=ALL-UNNAMED \
+     --enable-native-access=ALL-UNNAMED \
+     -cp nalim.jar:. Libc
 ```
 
-`intrinsic: 42` means Nalim recognized the compiled function. `@Link: 42` means it used the native fallback, which is normal if your C compiler emitted different instructions. To test the fallback, add `-Dnalim.noinline=true` before `-cp` in the last command. Remove it before timing the fast path.
+The two numbers should match `id -u` and `id -g`. For other JDKs, see
+[Running](#running).
 
-Look up the `MethodHandle` once, store it in a `static final` field, and call `invokeExact` with the exact primitive types. The function's machine code must stay unchanged while you use its Java equivalent. Both paths in this example require the v2 JAR because v1 has no `findIntrinsic` API.
+### 2. Linking by a different name
 
-## Benchmarks
+The Java name doesn't have to match the exported C symbol. Here `allocate`
+calls `malloc` and `release` calls `free`; on a 64-bit target, Java `long`
+holds a pointer or a `size_t`.
 
-[`BenchLeafCalls`](test/BenchLeafCalls.java) ran on Linux x86-64 with a Ryzen AI 9 365, OpenJDK 25.0.5.0.3, and G1. Each pair used two fresh JVMs pinned to the same core; the order alternated across eight pairs. The figures are medians across processes, in **nanoseconds per element of a warmed-up loop** (lower is better). On `main`, the benchmark's `MethodHandle` calls the linked native method because that version has no Java equivalent for the call.
+```java
+import one.nalim.Link;
+import one.nalim.Linker;
 
-| Operation in the loop | `main` (`d367a5e`) | v2 (`1.2.5`) |
-|---|---:|---:|
-| Add: plain `@Link` | 1.1150 | 1.1165 |
-| Add: `static final` + `invokeExact` | 1.1195 | 0.0625 |
-| Absolute value: plain `@Link` | 0.9022 | 0.9018 |
-| Absolute value: `static final` + `invokeExact` | 0.9030 | 0.0635 |
+public class Mem {
+    @Link(name = "malloc") public static native long allocate(long size);
+    @Link(name = "free")   public static native void release(long ptr);
 
-With `invokeExact`, v2 processed **17.9× as many additions** and **14.2× as many absolute values** per second as `main`. Plain `@Link` took about the same time on both versions. These ratios measure what the JIT can do with the whole loop; they don't predict individual call latency or Minecraft TPS.
+    static {
+        Linker.linkClass(Mem.class);
+    }
+}
+```
 
-To reproduce the comparison on Linux x86-64, use a full v2 clone with Git history, JDK 25, `cc`, Python 3, and `taskset`. Run the following from the repository root. The script picks an available CPU by default; pass `--cpu` to choose one (this run used `--cpu 2`).
+### 3. Working with arrays
+
+`@Library("crypto")` loads OpenSSL's `libcrypto` when the class is linked.
+The C prototype is `unsigned char *SHA256(const unsigned char *, size_t, unsigned char *)`.
+For a short input on a 64-bit system, pass both Java arrays directly. The
+third argument points at the array where OpenSSL writes the 32-byte digest.
+
+```java
+import one.nalim.Library;
+import one.nalim.Link;
+import one.nalim.Linker;
+
+@Library("crypto")
+public class LibCrypto {
+    @Link private static native long SHA256(byte[] data, long len, byte[] digest);
+
+    static {
+        Linker.linkClass(LibCrypto.class);
+    }
+
+    public static byte[] sha256(byte[] data) {
+        byte[] digest = new byte[32];
+        if (SHA256(data, data.length, digest) == 0) {
+            throw new IllegalStateException("SHA256 failed");
+        }
+        return digest;
+    }
+}
+```
+
+Use a library on `java.library.path` and validate lengths in Java before the
+call. Never retain a pointer into a Java array after the native method returns.
+
+### 4. Accessing object fields
+
+`@FieldOffset("sec")` passes the address of `sec` rather than the object's
+header. This example uses Linux `clock_gettime` on a 64-bit ABI where
+`struct timespec` consists of two consecutive 64-bit fields. Your Java field
+layout must match the native layout; Nalim does not marshal a struct.
+
+```java
+import one.nalim.FieldOffset;
+import one.nalim.Link;
+import one.nalim.Linker;
+
+public class Time {
+    public long sec;
+    public long nsec;
+
+    @Link private static native int clock_gettime(int clk_id, @FieldOffset("sec") Time time);
+
+    static {
+        Linker.linkClass(Time.class);
+    }
+
+    public static Time current() {
+        Time time = new Time();
+        if (clock_gettime(0, time) != 0) {  // CLOCK_REALTIME on Linux
+            throw new IllegalStateException("clock_gettime failed");
+        }
+        return time;
+    }
+}
+```
+
+### 5. Inlining raw machine code
+
+`@Code` installs the supplied bytes as the body of a Java method. This
+x86-64 example reads the timestamp counter and combines `EDX:EAX` into a
+64-bit return value. The same bytes are **not** an AArch64 implementation.
+
+```java
+import one.nalim.Code;
+import one.nalim.Linker;
+
+public class Cpu {
+    // rdtsc; shl $32, %rdx; or %rdx, %rax; ret
+    @Code("0f31 48c1e220 4809d0 c3")
+    public static native long rdtsc();
+
+    static {
+        Linker.linkClass(Cpu.class);
+    }
+}
+```
+
+### 6. Auto-inline and direct tail calls on x86-64
+
+For eligible `@Link` calls, Nalim can verify a small native body (up to 128
+bytes) and copy it into the installed method. Unrecognized instructions,
+indirect branches, or mutable globals leave the function on the native call
+path. When the ABI permits a tail jump, the linker can use a relative jump
+if the address is in range. None of this requires changing the Java declaration.
+
+`-Dnalim.trace.inline=true` shows binding decisions. Use `-Dnalim.noinline=true`
+or `-Dnalim.nodirect=true` for A/B tests, not as speed settings. Set
+`@Link(naked = true)` only for a function written for HotSpot's Java calling
+convention; it skips the normal conversion to the C ABI.
+
+## Building
+
+Use the checked-in [`nalim.jar`](nalim.jar), or build it with a JVMCI-capable
+JDK such as JDK 25. `./build.sh` needs only the JDK and a shell and writes
+`nalim.jar` in the repository root. `gradle clean jar` writes `build/libs/nalim.jar`.
+Both target Java 11 bytecode.
+
+## Running
+
+Nalim needs a HotSpot JDK that contains `jdk.internal.vm.ci` (check
+`java --list-modules`). The [basic example](#1-basic-usage) includes the
+classpath command for JDK 25. Explicit JVMCI `--add-exports` are not needed.
+On Windows, use `;` instead of `:` between classpath entries.
+
+| Stock JDK | What to change in the JDK 25 command |
+| --- | --- |
+| 21 through 24 | Add `-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI` before `--add-modules`. |
+| 25 | No changes. |
+| 26 | Add `-XX:-UseCodeCacheFlushing`. Otherwise HotSpot can discard an idle native binding that it cannot recompile. |
+| 27 | [OpenJDK removed JVMCI](https://bugs.openjdk.org/browse/JDK-8385142). Use a JDK with the module. The tested JDK 28 EA build also lacks it. |
+
+**Java agent.** As an alternative to `--add-opens`, pass `-javaagent:nalim.jar`
+before `-cp`. Keep `--add-modules=jdk.internal.vm.ci` and the options for your
+JDK. If a binding class does not call `Linker.linkClass` itself, you can pass
+its name at startup: `-javaagent:nalim.jar=com.example.MyLib,com.example.OtherLib`.
+
+**Flag-free runtime image.** Set `JAVA_HOME` to a JVMCI-capable JDK 21 or
+newer. Run [`./build-runtime.sh`](build-runtime.sh) on Linux or macOS. In
+Windows PowerShell, run [`build-runtime.ps1`](build-runtime.ps1) as `.\build-runtime.ps1`.
+Both builders write a `nalim-runtime` directory with the JVM flags already set
+and refuse to overwrite an existing directory. For the `Libc` example on Linux or macOS:
 
 ```sh
-(
-  set -e
-  baseline=$(mktemp -d)
-  trap 'rm -rf -- "$baseline"' EXIT
-  git show d367a5e:nalim.jar > "$baseline/main.jar"
-  python3 test/bench-link-paths.py "$baseline/main.jar" nalim.jar --workload leaves --pairs 8
-)
+./nalim-runtime/bin/java -cp nalim.jar:. Libc
 ```
 
-Look for `raw_add.intrinsic=1` and `raw_abs.intrinsic=1` in the `after` output. The script checks the results against expected checksums. To measure ordinary linking paths too, replace `--workload leaves` with `--workload paths leaves`.
+Build each image on the OS and architecture where it will run. Keep its
+`legal/` directory if you redistribute it.
 
-**RustMi call patterns.** In the [RustMi ABI benchmark](test/BenchRustMiAbi.java) on JDK 26, `spawncap` went from 1.369 to 1.199 ns per call between `main` and v2. `collision` barely changed (2.142 to 2.141 ns), and `distance` took slightly longer (2.084 to 2.097 ns).
+## Performance
 
-**Minecraft tick time.** A test server running RustMi 1.2.1 and Nalim 1.2.5 on Java 26 matched vanilla on 8,278,065 collision checks with zero mismatches. That run checked correctness. In a separate, earlier tick-time comparison of Nalim 1.2.1 and 1.2.2, the newer JAR won two of four pairs. Those runs did not show a consistent MSPT improvement from swapping the JAR alone.
+For arrays, compare a plain Java loop with one native call for the whole
+batch before trying a native call per element. For a small integer function
+in a hot loop, Linux x86-64 callers can try `Linker.findIntrinsic` once at
+setup and cache the exact handle. In a JDK 25 test on Linux x86-64, the
+`raw_add` loop processed 17.9 times as many elements per second through this
+handle as through v1's native fallback. Plain `@Link` addition took about the
+same time on both JARs. See the [results and reproduction command](docs/performance.md).
 
-## Platform support and builds
+## Supported platforms
 
-- **Platforms:** Nalim supports Linux and macOS on x86-64 and AArch64, and Windows on x86-64. `amd64` includes Intel and AMD CPUs. Windows on Arm is unsupported. The [native ABI tests](.github/workflows/platforms.yml) run on all five combinations with JDK 21, 25, and 26. RustMi automatically selects Nalim on a narrower set of platforms.
-- **Java:** Use HotSpot with `jdk.internal.vm.ci` (check `java --list-modules`). On JDK 21, add `-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI` to the example's JVM flags. On JDK 26, add `-XX:-UseCodeCacheFlushing`. On JDK 11 and 17, only the basic native call is tested, and only on Linux x86-64. Stock JDK 27 [removed JVMCI](https://bugs.openjdk.org/browse/JDK-8385142); the JDK 28 EA build we tested also lacks it. A launch flag cannot add a missing module.
-- **Build:** Run `sh build.sh` from the repository root to produce `nalim.jar`. To test an existing JAR, run `bash test/check-platform.sh nalim.jar` with JDK 21, 25, or 26 and a C compiler (Git Bash and GCC on Windows). To build a runtime with the JVM options already set, use [`build-runtime.sh`](build-runtime.sh) or [`build-runtime.ps1`](build-runtime.ps1).
+- **Linux:** x86-64 and AArch64
+- **macOS:** x86-64 and AArch64
+- **Windows:** x86-64
 
-Based on [Andrei Pangin's Nalim](https://github.com/apangin/nalim). [GPL-2.0-or-later](LICENSE).
+`amd64` includes Intel and AMD CPUs. Windows on Arm and RISC-V are unsupported.
+The [platform workflow](.github/workflows/platforms.yml) tests the shipped JAR
+and a source build on all five targets with JDK 21, 25, and 26. JDK 11 and 17
+have a basic native-call smoke test on Linux x86-64. To test your JAR on a
+supported JDK 21/25/26 target, run `bash test/check-platform.sh nalim.jar`
+with a C compiler (Git Bash and GCC on Windows).
+
+## Limitations
+
+1. Bind `static native` methods to a fixed C prototype. Match its argument widths
+   and return type. For a variadic C function, write a fixed-signature wrapper.
+2. The target cannot use `JNIEnv`, throw a Java exception, or call back into Java.
+3. Pass primitive values, primitive arrays, or the address of a primitive field.
+   Check references and buffer bounds in Java; native code has no such checks.
+4. Return promptly. A blocking operation or a long-running computation can hold
+   up a JVM safepoint. Use JNI or FFM for work that may block.
+5. GC support depends on the HotSpot/JVMCI build. The platform tests exercise
+   G1 and, where available, ZGC. Older supported HotSpot releases also work with
+   Serial and Parallel.
+
+[License: GPL-2.0-or-later](LICENSE).
