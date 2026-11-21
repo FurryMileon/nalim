@@ -10,10 +10,10 @@ if ([string]::IsNullOrWhiteSpace($env:JAVA_HOME)) {
 
 $jlink = Join-Path $env:JAVA_HOME "bin\jlink.exe"
 $releaseFile = Join-Path $env:JAVA_HOME "release"
-$modulePath = Join-Path $env:JAVA_HOME "jmods"
+$java = Join-Path $env:JAVA_HOME "bin\java.exe"
 if (-not (Test-Path -LiteralPath $jlink -PathType Leaf) -or
     -not (Test-Path -LiteralPath $releaseFile -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $modulePath -PathType Container)) {
+    -not (Test-Path -LiteralPath $java -PathType Leaf)) {
     throw "JAVA_HOME is not a complete JDK: $env:JAVA_HOME"
 }
 
@@ -26,7 +26,14 @@ $feature = [int]$versionMatch.Groups[1].Value
 if ($feature -lt 21) {
     throw "The Nalim runtime image requires JDK 21 or newer"
 }
-if (-not (Test-Path -LiteralPath (Join-Path $modulePath "jdk.internal.vm.ci.jmod") -PathType Leaf)) {
+# Linkable run-time images (JEP 493) need no separate jmods directory.
+$moduleList = & $java --list-modules
+if ($LASTEXITCODE -ne 0) { throw "Could not list modules in $env:JAVA_HOME" }
+$modules = $moduleList -replace '@.*$', ''
+if (-not (Test-Path -LiteralPath (Join-Path $env:JAVA_HOME 'jmods\java.base.jmod') -PathType Leaf)) {
+    $modules = $modules | Where-Object { $_ -notin 'jdk.jlink', 'jdk.jpackage' }
+}
+if ($modules -notcontains 'jdk.internal.vm.ci') {
     throw "This JDK does not contain jdk.internal.vm.ci; Nalim requires a JVMCI-capable HotSpot build"
 }
 if (Test-Path -LiteralPath $Output) {
@@ -43,8 +50,7 @@ if ($feature -ge 26) {
 }
 
 $jlinkArgs = @(
-    "--module-path", $modulePath,
-    "--add-modules", "ALL-MODULE-PATH",
+    "--add-modules", ($modules -join ','),
     "--add-options=$launchOptions",
     "--compress=zip-6",
     "--strip-debug",

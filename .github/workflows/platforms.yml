@@ -45,6 +45,17 @@ jobs:
         run: bash test/check-platform.sh nalim.jar
       - name: Build sources and run on the native ABI
         run: bash test/check-platform.sh
+      - name: Test the JDK 26 runtime image without launch flags
+        if: matrix.java == '26' && (matrix.os == 'ubuntu-24.04' || matrix.os == 'windows-2022')
+        run: |
+          if [[ $RUNNER_OS == Windows ]]; then
+            image=$(cygpath -au "$RUNNER_TEMP")/nalim-runtime
+            pwsh -NoProfile -NonInteractive -File ./build-runtime.ps1 -Output "$(cygpath -aw "$image")"
+          else
+            image=$RUNNER_TEMP/nalim-runtime
+            sh build-runtime.sh "$image"
+          fi
+          JAVA_HOME="$image" NALIM_TEST_BAKED=1 bash test/check-platform.sh nalim.jar
       - name: Exercise Win64 emitter against Linux ms_abi callees
         if: matrix.os == 'ubuntu-24.04' && matrix.java == '25'
         working-directory: ${{ runner.temp }}

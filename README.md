@@ -164,8 +164,8 @@ included; requirements above the JVM's `CodeEntryAlignment` cannot use the pool)
 On Linux x86-64, an exported symbol can also be a direct jump to the actual
 implementation. Nalim follows up to four out-of-window entry jumps (`jmp rel8`
 or `jmp rel32`, optionally after `ENDBR64`) inside the **same read-only executable
-mapping**, then verifies the destination as usual. Speculative target and
-cross-page and literal reads go through procfs during binding, not at call time.
+mapping**, then verifies the destination as usual. Nalim reads speculative
+targets, page crossings and literal data through procfs during binding, not at call time.
 Indirect dispatch slots are never followed. If verification or a read fails,
 the adapter calls the original symbol. While a binding is used, its native
 text and any pooled constants must stay unchanged.
@@ -304,12 +304,14 @@ $env:JAVA_HOME = "C:\path\to\jdk-25"
 .\nalim-runtime\bin\java.exe -cp "nalim.jar;app.jar" MainClass
 ```
 
-The builders require a JDK 21 or newer **with JVMCI** and refuse to overwrite
-an existing output directory. Pass a path as the first argument to use a name
-other than `nalim-runtime`.
+The builders require JDK 21 or newer **with JVMCI** and refuse to overwrite an
+existing output directory. They also support JDK distributions that link from
+their runtime image instead of shipping `jmods/`. Pass a path as the first
+argument to use a name other than `nalim-runtime`.
 
-The image contains all modules from the selected JDK and bakes these startup
-defaults:
+The image contains the selected JDK's runtime modules and bakes in the
+startup flags below. With a JMOD-less JDK it omits `jdk.jlink` and
+`jdk.jpackage`: that JDK cannot package the image-building tools themselves.
 
 | JDK | Options embedded in the image |
 | --- | --- |

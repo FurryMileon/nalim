@@ -32,9 +32,12 @@ cd "$work"
 "$compiler" -std=c11 -O2 "${shared[@]}" platform_abi.c -o "$library"
 javac -cp nalim.jar -d . PlatformAbiTest.java PlatformSelectionTest.java
 
-vm=(--add-modules=jdk.internal.vm.ci --add-opens=java.base/java.lang=ALL-UNNAMED --enable-native-access=ALL-UNNAMED)
-if (( feature < 25 )); then vm+=(-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI); fi
-if (( feature >= 26 )); then vm+=(-XX:-UseCodeCacheFlushing); fi
+vm=()
+if [[ ${NALIM_TEST_BAKED:-0} != 1 ]]; then
+    vm+=(--add-modules=jdk.internal.vm.ci --add-opens=java.base/java.lang=ALL-UNNAMED --enable-native-access=ALL-UNNAMED)
+    if (( feature < 25 )); then vm+=(-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI); fi
+    if (( feature >= 26 )); then vm+=(-XX:-UseCodeCacheFlushing); fi
+fi
 java "${vm[@]}" -cp "$classpath" one.nalim.PlatformSelectionTest
 vm+=(-Xmx128m -Xbatch -XX:-TieredCompilation -XX:CompileThreshold=1000
      -XX:CompileCommand=dontinline,PlatformAbiTest::machineCall -Djava.library.path=. -cp "$classpath")

@@ -11,8 +11,8 @@ fi
 
 jlink="$JAVA_HOME/bin/jlink"
 release_file="$JAVA_HOME/release"
-module_path="$JAVA_HOME/jmods"
-if [ ! -x "$jlink" ] || [ ! -f "$release_file" ] || [ ! -d "$module_path" ]; then
+java="$JAVA_HOME/bin/java"
+if [ ! -x "$jlink" ] || [ ! -x "$java" ] || [ ! -f "$release_file" ]; then
     echo "JAVA_HOME is not a complete JDK: $JAVA_HOME" >&2
     exit 1
 fi
@@ -28,10 +28,20 @@ if [ "$feature" -lt 21 ]; then
     echo "The Nalim runtime image requires JDK 21 or newer" >&2
     exit 1
 fi
-if [ ! -f "$module_path/jdk.internal.vm.ci.jmod" ]; then
-    echo "This JDK does not contain jdk.internal.vm.ci; Nalim requires a JVMCI-capable HotSpot build" >&2
-    exit 1
+# With JEP 493 a full JDK may have no jmods directory. Query the running
+# image and let its own jlink choose the matching module source.
+modules=$("$java" --list-modules)
+modules=$(printf '%s\n' "$modules" | cut -d@ -f1)
+if [ ! -f "$JAVA_HOME/jmods/java.base.jmod" ]; then
+    # jlink cannot put itself (or jpackage, which requires it) in a
+    # second-generation image without packaged modules.
+    modules=$(printf '%s\n' "$modules" | grep -vx -e jdk.jlink -e jdk.jpackage)
 fi
+modules=$(printf '%s\n' "$modules" | paste -sd, -)
+case ",$modules," in
+    *,jdk.internal.vm.ci,*) ;;
+    *) echo "This JDK does not contain jdk.internal.vm.ci; Nalim requires a JVMCI-capable HotSpot build" >&2; exit 1 ;;
+esac
 if [ -e "$output" ]; then
     echo "Output already exists: $output" >&2
     echo "Remove it explicitly before rebuilding" >&2
@@ -48,8 +58,7 @@ if [ "$feature" -ge 26 ]; then
 fi
 
 "$jlink" \
-    --module-path "$module_path" \
-    --add-modules ALL-MODULE-PATH \
+    --add-modules "$modules" \
     --add-options="$launch_options" \
     --compress zip-6 \
     --strip-debug \
