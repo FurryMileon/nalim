@@ -427,7 +427,7 @@ public class Linker {
         final byte[] code = new byte[MAX_INLINE_BYTES];
         byte[] lengths;
         byte[] queue;
-        final Insn insn = new Insn();
+        Insn insn;
         Fixups literals;
         Fixups rebases;
     }
@@ -502,6 +502,7 @@ public class Linker {
 
         // ── pass 1: decode and validate ─────────────────────────────────
         Insn insn = scratch.insn;
+        if (insn == null) scratch.insn = insn = new Insn();
         Fixups literals = scratch.literals, rebases = scratch.rebases;
         if (literals != null) literals.count = 0;
         if (rebases != null) rebases.count = 0;
