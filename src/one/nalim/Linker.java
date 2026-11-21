@@ -426,7 +426,7 @@ public class Linker {
     private static final class InlineScratch {
         final byte[] code = new byte[MAX_INLINE_BYTES];
         final byte[] lengths = new byte[MAX_INLINE_BYTES];
-        final byte[] queue = new byte[MAX_INLINE_BYTES];
+        byte[] queue;
         final Insn insn = new Insn();
         Fixups literals;
         Fixups rebases;
@@ -523,11 +523,9 @@ public class Linker {
         Arrays.fill(lengths, 0, window, (byte) 0);
         int head = 0;
         int tail = 0;
-        queue[tail++] = 0;
-        lengths[0] = QUEUED;
+        int i = 0; // the first block needs no queue
 
-        while (head < tail) {
-            int i = queue[head++] & 0xff;
+        for (;;) {
             for (;;) {
                 if (i >= window) return null;
                 if (lengths[i] > 0) break;            // merges into a verified block
@@ -655,6 +653,7 @@ public class Linker {
                         int dest = (t == 0) ? target : fallthrough;
                         if (dest < 0 || dest >= window || lengths[dest] == INTERIOR) return null;
                         if (lengths[dest] == 0) {
+                            if (queue == null) scratch.queue = queue = new byte[MAX_INLINE_BYTES];
                             lengths[dest] = QUEUED;
                             queue[tail++] = (byte) dest;
                         }
@@ -664,6 +663,8 @@ public class Linker {
                 if (terminator) break;
                 i += length;
             }
+            if (head == tail) break;
+            i = queue[head++] & 0xff;
         }
         if (retCount == 0) {
             if (TRACE_INLINE) {
