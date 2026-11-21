@@ -436,7 +436,7 @@ after. Each loop consumes changing integers and checks its sum. Nanoseconds
 per element measure loop throughput, not the latency of an isolated FFI
 call. Symbol lookup and intrinsic setup are outside these loops.
 
-| Measurement | First-pass jar | Current jar (`edbeb0ee`) |
+| Measurement | First-pass jar | Benchmarked v2 jar (`edbeb0ee`) |
 | --- | ---: | ---: |
 | `raw_add` via static-final handle (ns/element) | 2.5287 | 0.1515 |
 | `raw_abs` via static-final handle (ns/element) | 2.0216 | 0.1535 |
