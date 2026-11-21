@@ -11,7 +11,7 @@ public final class NativeMappingsTest {
                 + "2000-3000 r--p 0 00:00 0 /" + "x".repeat(9000) + "\n"
                 + "3000-4000 rwxp 0 00:00 0\n"
                 + "9000000000000000-fffffffffffffff0 r-xs");
-        long[] expected = {0x1000, 0x2000, 1, 0x2000, 0x3000, 0, 0x9000000000000000L, -16L, 1};
+        long[] expected = {0x1001, 0x2000, 0x2000, 0x3000, 0x9000000000000001L, -16L};
         // The bad line exceeds the carry prefix by one byte. No earlier VMA
         // may be returned as an executable proof after a truncated header.
         byte[] malformed = bytes("1000-2000 r-xp\n10000000000000000-fffffffffffffff0 r-xp\n");
@@ -26,6 +26,10 @@ public final class NativeMappingsTest {
             } catch (NumberFormatException rejectedByAddressParser) {
                 // The procfs reader also rejects the entire snapshot in this case.
             }
+        }
+        byte[] oddStart = bytes("1000-2000 r-xp\n2001-3000 r-xp\n");
+        if (NativeMappings.readRanges(stream(oddStart, oddStart.length)).length != 0) {
+            throw new AssertionError("unaligned start overlaps the execute flag");
         }
         System.out.println("NativeMappingsTest PASS");
     }

@@ -28,8 +28,9 @@ import java.util.Arrays;
 
 /** Mapping proofs for native code and literals. Callers keep the originating library loaded. */
 final class NativeMappings {
-    // Sorted, disjoint triples: inclusive start, exclusive end, executable flag.
+    // Sorted, disjoint pairs: inclusive start with an executable bit, exclusive end.
     // Never merge adjacent VMAs, even when their permissions match.
+    private static final long EXECUTABLE = 1;
     private static final long[] NO_RANGES = new long[0];
     private static volatile long[] cached;
     private static final int MAX_JUMPS = 4;
@@ -60,7 +61,7 @@ final class NativeMappings {
         if (address <= 0) return null;
         long[] ranges = parse();
         int i = containing(ranges, address);
-        if (i < 0 || ranges[i + 2] == 0) return null;
+        if (i < 0 || (ranges[i] & EXECUTABLE) == 0) return null;
         int n = bounded(pageWindow(address, max), ranges[i + 1] - address);
         byte[] bytes = new byte[n];
         return readAt(address, ByteBuffer.wrap(bytes)) ? bytes : null;
@@ -80,7 +81,7 @@ final class NativeMappings {
     static synchronized int extendCodeWindow(long address, byte[] code, int first) {
         long[] ranges = cached = parse();
         int i = containing(ranges, address);
-        if (i < 0 || ranges[i + 2] == 0) return first;
+        if (i < 0 || (ranges[i] & EXECUTABLE) == 0) return first;
         int n = bounded(code.length, ranges[i + 1] - address);
         if (n <= first || !readAt(address + first, ByteBuffer.wrap(code, first, n - first))) return first;
         return n;
@@ -104,8 +105,8 @@ final class NativeMappings {
 
         long[] ranges = parse(); // A cached VMA may have split since the last link.
         int i = containing(ranges, address);
-        if (i < 0 || ranges[i + 2] == 0) return 0;
-        long start = ranges[i], end = ranges[i + 1], current = address;
+        if (i < 0 || (ranges[i] & EXECUTABLE) == 0) return 0;
+        long start = ranges[i] & ~EXECUTABLE, end = ranges[i + 1], current = address;
         long[] prior = null;
         try (FileChannel memory = FileChannel.open(PROCESS_MEMORY)) {
             ByteBuffer dst = ByteBuffer.wrap(code);
@@ -156,11 +157,11 @@ final class NativeMappings {
     }
 
     private static int containing(long[] ranges, long address) {
-        int lo = 0, hi = ranges.length / 3;
+        int lo = 0, hi = ranges.length >>> 1;
         while (lo < hi) {
             int mid = (lo + hi) >>> 1;
-            int i = mid * 3;
-            if (Long.compareUnsigned(address, ranges[i]) < 0) hi = mid;
+            int i = mid << 1;
+            if (Long.compareUnsigned(address, ranges[i] & ~EXECUTABLE) < 0) hi = mid;
             else if (Long.compareUnsigned(address, ranges[i + 1]) >= 0) lo = mid + 1;
             else return i;
         }
@@ -245,7 +246,7 @@ final class NativeMappings {
         private static final long LOW_BITS = 0x7f7f7f7f7f7f7f7fL;
         private static final long NEWLINES = '\n' * 0x0101010101010101L;
 
-        long[] values = new long[3 * 128];
+        long[] values = new long[2 * 128];
         int used;
 
         private static int newline(byte[] bytes, int from, int end) {
@@ -271,12 +272,13 @@ final class NativeMappings {
             if (dash <= from || dash == sp) return false;
             long start = address(line, from, dash);
             long finish = address(line, dash + 1, sp);
-            if (Long.compareUnsigned(start, finish) >= 0
-                    || (used != 0 && Long.compareUnsigned(start, values[used - 2]) < 0)) return false;
+            // Real procfs VMAs are page-aligned; reject an odd start rather
+            // than letting a malformed header leak into the execute flag.
+            if ((start & EXECUTABLE) != 0 || Long.compareUnsigned(start, finish) >= 0
+                    || (used != 0 && Long.compareUnsigned(start, values[used - 1]) < 0)) return false;
             if (used == values.length) values = Arrays.copyOf(values, used * 2);
-            values[used++] = start;
+            values[used++] = start | (execute == 'x' ? EXECUTABLE : 0);
             values[used++] = finish;
-            values[used++] = execute == 'x' ? 1 : 0;
             return true;
         }
     }
