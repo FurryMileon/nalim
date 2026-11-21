@@ -237,7 +237,7 @@ public class Linker {
         // 8 bytes to load a spill, 7 for a field LEA, 8 for the outgoing store.
         int capacity = framed ? 160 + 24 * Math.max(0, types.length - 4) : 128;
         ByteBuffer buf = ByteBuffer.allocate(capacity).order(ByteOrder.nativeOrder());
-        EntryBarrier entryBarrier = emitEntryBarrierPrologue(buf);
+        emitEntryBarrierPrologue(buf);
         int shuffleStart = buf.position();
 
         // Scalar templates already consume Java registers. Don't generate an
@@ -273,7 +273,7 @@ public class Linker {
                 ByteBuffer inline = tryInlineSmallFunction(buf, address, symbol, returnType, scratch,
                         !naked && SYSV_AMD64 ? shuffleStart : -1, types, pendingScalarShuffle);
                 if (inline != null) {
-                    installCode(m, inline, null, entryBarrier, scratch.rebases);
+                    installCode(m, inline, null, scratch.rebases);
                     return scratch;
                 }
             }
@@ -290,7 +290,7 @@ public class Linker {
             }
         }
 
-        installCode(m, buf, directJump, entryBarrier, null);
+        installCode(m, buf, directJump, null);
         return scratch;
     }
 
@@ -1500,9 +1500,9 @@ public class Linker {
     private static void installHexCode(Method m, String hex) {
         checkMethodType(m);
         ByteBuffer buf = rawCodeBuffer(HexCode.decodedLength(hex));
-        EntryBarrier entryBarrier = emitEntryBarrierPrologue(buf);
+        emitEntryBarrierPrologue(buf);
         HexCode.emit(buf, hex);
-        installCode(m, buf, null, entryBarrier, null);
+        installCode(m, buf, null, null);
     }
 
     private static ByteBuffer rawCodeBuffer(int length) {
@@ -1521,29 +1521,16 @@ public class Linker {
         checkMethodType(m);
         Objects.checkFromIndexSize(0, length, code.length);
         ByteBuffer buf = rawCodeBuffer(length);
-        EntryBarrier entryBarrier = emitEntryBarrierPrologue(buf);
+        emitEntryBarrierPrologue(buf);
         buf.put(code, 0, length);
-        installCode(m, buf, null, entryBarrier, null);
+        installCode(m, buf, null, null);
     }
 
-    /**
-     * AMD64 entry barrier metadata and the internal branch that reaches its
-     * out-of-line slow path. The hot path remains frameless: one CMP plus one
-     * normally-not-taken JNE, then the original Nalim body unchanged.
-     */
-    private static final class EntryBarrier {
-        final int patchOffset;
-        final int branchDispOffset;
-        final int continuationOffset;
-        int frameCompleteOffset;
-        Call slowCall;
-
-        EntryBarrier(int patchOffset, int branchDispOffset, int continuationOffset) {
-            this.patchOffset = patchOffset;
-            this.branchDispOffset = branchDispOffset;
-            this.continuationOffset = continuationOffset;
-        }
-    }
+    // All executable AMD64 entry barriers have the same prefix. Only the
+    // positions in the out-of-line slow path are specific to a method.
+    private static final int AMD64_ENTRY_PATCH_OFFSET = 8;  // 5-byte verified-entry NOP + 3-byte NOP
+    private static final int AMD64_ENTRY_BRANCH_DISP = AMD64_ENTRY_PATCH_OFFSET + 8 + 2; // CMP, JNE opcode
+    private static final int AMD64_ENTRY_CONTINUATION = AMD64_ENTRY_BRANCH_DISP + 4;
 
     // EXPERIMENTAL, measurement only: -Dnalim.unsafe.legacybarrier=true drops
     // the executable AMD64 entry-barrier prologue and installs the legacy
@@ -1551,16 +1538,16 @@ public class Linker {
     // per-call CMP+JNE but forfeits cold-flush protection on JDK 26+ and any
     // future GC that relies on nmethod entry barriers actually executing.
     private static final boolean LEGACY_BARRIER = Boolean.getBoolean("nalim.unsafe.legacybarrier");
+    private static final boolean EXECUTABLE_AMD64_BARRIER = MARK_ENTRY_BARRIER_PATCH != null && AMD64 && !LEGACY_BARRIER;
+    private static final Mark AMD64_ENTRY_PATCH = EXECUTABLE_AMD64_BARRIER
+            ? new Mark(AMD64_ENTRY_PATCH_OFFSET, MARK_ENTRY_BARRIER_PATCH) : null;
 
-    private static EntryBarrier emitEntryBarrierPrologue(ByteBuffer buf) {
-        if (MARK_ENTRY_BARRIER_PATCH == null || !AMD64 || LEGACY_BARRIER) {
-            return null;
-        }
+    private static void emitEntryBarrierPrologue(ByteBuffer buf) {
+        if (!EXECUTABLE_AMD64_BARRIER) return;
         if (buf.position() != 0) {
             throw new IllegalStateException("AMD64 entry barrier must be the first instruction");
         }
-        if (THREAD_DISARMED_OFFSET == null || NMETHOD_ENTRY_BARRIER == null
-                || NMETHOD_ENTRY_BARRIER == 0) {
+        if (THREAD_DISARMED_OFFSET == null || NMETHOD_ENTRY_BARRIER == null || NMETHOD_ENTRY_BARRIER == 0) {
             throw new IllegalStateException("HotSpot did not expose the nmethod entry-barrier config");
         }
         int threadOffset = THREAD_DISARMED_OFFSET;
@@ -1578,23 +1565,19 @@ public class Linker {
 
         // Canonical eight-byte CMP. Its imm32 starts four bytes into the
         // instruction and is naturally aligned for atomic GC patching.
-        int patchOffset = buf.position();
         buf.put((byte) 0x41).put((byte) 0x81).put((byte) 0x7F).put((byte) threadOffset);
         buf.putInt(0);                                           // armed epoch; HotSpot patches it
 
         // Fast path falls through. The rare armed/not-entrant case gets a real
         // 32-byte frame in the out-of-line block appended after the method body.
-        buf.put((byte) 0x0F).put((byte) 0x85);                   // jne rel32
-        int branchDispOffset = buf.position();
-        buf.putInt(0);
-        return new EntryBarrier(patchOffset, branchDispOffset, buf.position());
+        buf.put((byte) 0x0F).put((byte) 0x85).putInt(0);         // jne rel32
     }
 
     // A/B diagnostics: -Dnalim.legacypad=true restores the original 1-byte-nop
     // padding so the coalesced-NOP prologue can be measured in isolation.
     private static final boolean LEGACY_PAD = Boolean.getBoolean("nalim.legacypad");
 
-    private static void finishEntryBarrier(ByteBuffer buf, EntryBarrier barrier) {
+    private static Site[] finishEntryBarrier(ByteBuffer buf, Call directJump) {
         // Put the frame-dismantling block before FRAME_COMPLETE. An asynchronous
         // walk either sees the exact slow frame at the call or conservatively
         // treats the frameless hot body / tiny epilogue as not frame-complete.
@@ -1602,24 +1585,29 @@ public class Linker {
         buf.put((byte) 0xC9);                                    // leave
         buf.put((byte) 0xE9);                                    // jmp hot continuation
         int epilogueJumpDisp = buf.position();
-        buf.putInt(barrier.continuationOffset - (epilogueJumpDisp + 4));
+        buf.putInt(AMD64_ENTRY_CONTINUATION - (epilogueJumpDisp + 4));
 
         int slowPathOffset = buf.position();
-        buf.putInt(barrier.branchDispOffset,
-                slowPathOffset - (barrier.branchDispOffset + 4));
+        buf.putInt(AMD64_ENTRY_BRANCH_DISP, slowPathOffset - AMD64_ENTRY_CONTINUATION);
         buf.put((byte) 0x55);                                    // push rbp
         buf.put((byte) 0x48).put((byte) 0x89).put((byte) 0xE5);  // mov rbp, rsp
         buf.put((byte) 0x48).put((byte) 0x83).put((byte) 0xEC).put((byte) 0x10); // sub rsp, 16
 
-        barrier.frameCompleteOffset = buf.position();
         int callOffset = buf.position();
         buf.put((byte) 0xE8).putInt(0);
-        barrier.slowCall = new Call(
-                new HotSpotForeignCallTarget(NMETHOD_ENTRY_BARRIER), callOffset, 5, true, null);
+        Call slowCall = new Call(new HotSpotForeignCallTarget(NMETHOD_ENTRY_BARRIER), callOffset, 5, true, null);
 
         buf.put((byte) 0xE9);                                    // jmp slow epilogue
         int slowReturnDisp = buf.position();
         buf.putInt(epilogueOffset - (slowReturnDisp + 4));
+
+        Site[] sites = new Site[2 + (directJump == null ? 0 : 1) + (MARK_FRAME_COMPLETE == null ? 0 : 1)];
+        int i = 0;
+        sites[i++] = AMD64_ENTRY_PATCH;
+        if (directJump != null) sites[i++] = directJump;
+        if (MARK_FRAME_COMPLETE != null) sites[i++] = new Mark(callOffset, MARK_FRAME_COMPLETE);
+        sites[i] = slowCall;
+        return sites;
     }
 
     private static final Site[] NO_SITES = new Site[0];
@@ -1628,20 +1616,12 @@ public class Linker {
     private static final DataPatch[] NO_PATCHES = new DataPatch[0];
     private static final byte[] NO_DATA = new byte[0];
 
-    private static void installCode(Method m, ByteBuffer buf, Call directJump, EntryBarrier entryBarrier,
-                                    Fixups rebases) {
+    private static void installCode(Method m, ByteBuffer buf, Call directJump, Fixups rebases) {
         Site[] sites;
         int totalFrameSize = 0;
-        if (entryBarrier != null) {
-            finishEntryBarrier(buf, entryBarrier);
+        if (EXECUTABLE_AMD64_BARRIER) {
+            sites = finishEntryBarrier(buf, directJump);
             totalFrameSize = 32; // return address + saved rbp + 16-byte aligned slow frame
-
-            sites = new Site[2 + (directJump == null ? 0 : 1) + (MARK_FRAME_COMPLETE == null ? 0 : 1)];
-            int i = 0;
-            sites[i++] = new Mark(entryBarrier.patchOffset, MARK_ENTRY_BARRIER_PATCH);
-            if (directJump != null) sites[i++] = directJump;
-            if (MARK_FRAME_COMPLETE != null) sites[i++] = new Mark(entryBarrier.frameCompleteOffset, MARK_FRAME_COMPLETE);
-            sites[i] = entryBarrier.slowCall;
         } else if (MARK_ENTRY_BARRIER_PATCH != null) {
             int markOffset = callingConvention.emitNMethodBarrier(buf);
             // Emit both FRAME_COMPLETE (id=6) and ENTRY_BARRIER_PATCH (id=7)
