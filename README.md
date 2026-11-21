@@ -417,6 +417,12 @@ first-class timer starts **after** JVMCI initialization and library loading.
 The warmed linking tests bind fresh classes, excluding class definition;
 allocations are Java heap bytes on the linking thread, not code-cache space.
 
+For an offline baseline on Linux x86-64 with JDK 25, run `bash autoresearch.sh`.
+It builds the current sources in a temporary directory and measures five pinned
+JVMs per workload. `rustmi_abi_ns_per_call` is the geometric mean of the median
+times for three `@Link` signatures used by RustMi. These fixtures measure native
+call throughput with small checked bodies, not RustMi's kernels or Minecraft ticks.
+
 Linux x86-64, Ryzen AI 9 365, OpenJDK 25.0.5.0.3, G1; median of eight JVMs
 per jar. The baseline already used **direct** jumps/calls for both wrappers.
 
