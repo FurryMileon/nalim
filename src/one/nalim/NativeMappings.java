@@ -186,7 +186,7 @@ final class NativeMappings {
     // Two unsigned 64-bit addresses, dash, space and four permission bytes.
     private static final int MAP_PREFIX_SIZE = 16 + 1 + 16 + 1 + 4;
 
-    private static long[] readRanges(InputStream maps) throws IOException {
+    static long[] readRanges(InputStream maps) throws IOException {
         Ranges ranges = new Ranges();
         byte[] block = new byte[8192], prefix = null;
         int pending = 0;
@@ -242,7 +242,10 @@ final class NativeMappings {
 
         boolean append(byte[] line, int from, int end) {
             int sp = findByte(line, from, end, ' ');
-            if (sp + 4 >= end || line[sp + 1] != 'r' || line[sp + 2] != '-') return true;
+            // A split line can fill the carry buffer without finishing its header.
+            // Reject that snapshot rather than treating the line as a non-RO mapping.
+            if (sp + 4 >= end) return false;
+            if (line[sp + 1] != 'r' || line[sp + 2] != '-') return true;
             int execute = line[sp + 3], sharing = line[sp + 4];
             if ((execute != '-' && execute != 'x') || (sharing != 'p' && sharing != 's')) return false;
             int dash = findByte(line, from, sp, '-');
