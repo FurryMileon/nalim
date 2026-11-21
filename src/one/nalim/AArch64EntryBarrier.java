@@ -128,7 +128,7 @@ final class AArch64EntryBarrier {
         }
         buf.putInt(0xa9bf7bfd);                                  // stp x29, x30, [sp, #-16]!
         buf.putInt(0x910003fd);                                  // mov x29, sp
-        int frameComplete = buf.position();
+        int frameComplete = Linker.checkedFrameCompleteOffset(buf.position());
         // The stub anchors its last Java frame at our SP/FP and BLR return PC.
         // Its rejected-entry path unwinds this frame instead of returning here.
         // Use the permanent VM stub address (as in JVMCI's AArch64TestAssembler),

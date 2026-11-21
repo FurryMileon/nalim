@@ -45,9 +45,11 @@ EXPORT uint16_t abi_char(int32_t x) { return (uint16_t)x; }
 /* These entry points consume HotSpot registers and stack slots, not C arguments.
  * Poison bits 16..31 so Java must sign-extend the short result. */
 #ifdef _WIN32
+#define JAVA_GP1 "%rdx"
 #define JAVA_GP5 "%esi"
 #define JAVA_GP6 "%ecx"
 #else
+#define JAVA_GP1 "%rsi"
 #define JAVA_GP5 "%r9d"
 #define JAVA_GP6 "%edi"
 #endif
@@ -62,5 +64,10 @@ EXPORT __attribute__((naked)) int16_t abi_java_spills(void) {
     __asm__("cvttss2si 16(%rsp), %eax\n\t"  /* ninth FP */
             "sub 8(%rsp), %eax\n\t"         /* seventh GP */
             "xor $0x55550000, %eax\n\tret");
+}
+
+EXPORT __attribute__((naked)) bool abi_java_same(void) {
+    /* Java-ABI references are compared for identity, never dereferenced. */
+    __asm__("cmpq " JAVA_GP1 ", 8(%rsp)\n\tsete %al\n\tret");
 }
 #endif

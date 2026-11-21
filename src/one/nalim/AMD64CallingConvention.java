@@ -26,17 +26,13 @@ import java.nio.ByteBuffer;
 abstract class AMD64CallingConvention extends CallingConvention {
 
     private static int stackArgumentCount(Class<?>[] parameterTypes) {
-        int integerArgs = 0;
         int floatingArgs = 0;
         for (Class<?> type : parameterTypes) {
-            if (type == float.class || type == double.class) {
-                floatingArgs++;
-            } else if (++integerArgs > 6 && !type.isPrimitive()) {
-                // A stack slot containing an oop is not a native data pointer.
-                throw new IllegalArgumentException("Too many object arguments");
-            }
+            if (type == float.class || type == double.class) floatingArgs++;
         }
-        return Math.max(0, integerArgs - 6) + Math.max(0, floatingArgs - 8);
+        // Native-ABI shuffles validate references before we get here. Naked
+        // Java-ABI targets expect exactly the caller's original oop in its slot.
+        return Math.max(0, parameterTypes.length - floatingArgs - 6) + Math.max(0, floatingArgs - 8);
     }
 
     // At most 14 bytes here, 12 for the indirect call and 11 for the return.

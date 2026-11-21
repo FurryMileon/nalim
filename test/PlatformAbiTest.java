@@ -39,6 +39,8 @@ public class PlatformAbiTest {
                 int a, int b, int c, int d, int e, int f,
                 float g, float h, float i, float j, float k, float l, float m, float n,
                 int seventh, float ninthFp);
+        @Link(naked = true) static native boolean abi_java_same(
+                Object first, int b, int c, int d, int e, int f, Object seventh);
     }
 
     static class X64 { @Code("b8 29 00 00 00 c3") static native int value(); }
@@ -73,12 +75,14 @@ public class PlatformAbiTest {
                     "naked register-only short return");
             check(Narrow.abi_java_spills(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 384, -47.5f) == -431,
                     "naked spilled short return");
+            check(Narrow.abi_java_same(box, 2, 3, 4, 5, 6, box), "same spilled reference");
+            check(!Narrow.abi_java_same(box, 2, 3, 4, 5, 6, array), "distinct spilled reference");
         }
     }
 
     public static void main(String[] args) throws Exception {
         check(AMD64 || ARCH.equals("aarch64") || ARCH.equals("arm64"), "unsupported fixture ISA: " + ARCH);
-        Linker.loadLibrary("platform_abi");
+        Linker.loadLibrary(args.length == 0 ? "platform_abi" : args[0]);
         Linker.linkClass(PlatformAbiTest.class);
         if (AMD64) Linker.linkClass(Narrow.class);
         if (!(AMD64 && System.getProperty("os.name").equals("Linux"))) {
@@ -99,6 +103,21 @@ public class PlatformAbiTest {
         check(machineCall() == 73, "compiled caller did not follow relink");
         System.gc();
         check(machineCall() == 73, "relinked @Code after GC");
+        // A small constant body followed by a legal, unused literal area.
+        // Its size alone fits int16_t; the out-of-line frame mark does not.
+        byte[] first = HexFormat.of().parseHex(method.getAnnotation(Code.class).value().replace(" ", ""));
+        byte[] large = java.util.Arrays.copyOf(first, Short.MAX_VALUE - 3);
+        if (Runtime.version().feature() >= 23) {
+            try {
+                Linker.installCode(method, large);
+                throw new AssertionError("installed a frame mark too large for HotSpot");
+            } catch (IllegalArgumentException expected) {
+                check(machineCall() == 73, "rejected relink replaced the previous code");
+            }
+        } else {
+            Linker.installCode(method, large);
+            check(machineCall() == 41, "large body on HotSpot with a 32-bit frame offset");
+        }
         checkAbi();
         System.out.println("PlatformAbiTest passed: " + System.getProperty("os.name") + " " + ARCH);
     }

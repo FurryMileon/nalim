@@ -135,6 +135,11 @@ public class Cpu {
 }
 ```
 
+On HotSpot 23–26, the installed `FRAME_COMPLETE` offset must fit in a signed
+16-bit field. For raw `@Code` and `Linker.installCode` this includes the body,
+any literal bytes, and the barrier prefix before the frame mark. Nalim rejects
+an oversized binding before replacing the method's current code.
+
 #### 6. Auto-inline and direct tail calls on x86-64
 
 Every `@Link` target is conservatively inspected before Nalim emits a call stub.
@@ -184,7 +189,8 @@ with multiple exits, Nalim inserts that extension at every reachable `ret` /
 `rep ret` and adjusts the internal branches and RIP operands. If a short
 branch would no longer fit, the original call bridge is used instead.
 The x86-64 bridge forwards primitive arguments spilled to the stack as well
-as those passed in registers.
+as those passed in registers. A `naked = true` target receives Java references
+unchanged in either location; they are not native array or field pointers.
 Non-AMD64 narrow native returns are not supported yet.
 
 On Linux AMD64, a small set of complete integer functions and single `int`/`long`

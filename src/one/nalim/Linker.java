@@ -36,6 +36,7 @@ import jdk.vm.ci.runtime.JVMCI;
 import jdk.vm.ci.runtime.JVMCIBackend;
 import jdk.vm.ci.runtime.JVMCICompiler;
 
+import java.io.File;
 import java.lang.annotation.Annotation;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodType;
@@ -127,7 +128,7 @@ public class Linker {
         // call findAddress before the first thread's System.load has finished.
         if (nativeLibraries.putIfAbsent(name, Boolean.TRUE) == null) {
             try {
-                if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0) {
+                if (name.indexOf('/') >= 0 || (File.separatorChar == '\\' && name.indexOf('\\') >= 0)) {
                     System.load(name);
                 } else {
                     System.loadLibrary(name);
@@ -1519,8 +1520,23 @@ public class Linker {
         installCode(m, buf, null, false);
     }
 
+    // CodeBlob::_frame_complete_offset changed from int to int16_t in
+    // HotSpot 23. JVMCI does not export this field's type in its config store.
+    private static final int MAX_FRAME_COMPLETE_OFFSET =
+            Runtime.version().feature() >= 23 ? Short.MAX_VALUE : Integer.MAX_VALUE;
+
+    static int checkedFrameCompleteOffset(int offset) {
+        if (offset > MAX_FRAME_COMPLETE_OFFSET) {
+            throw new IllegalArgumentException("HotSpot FRAME_COMPLETE offset exceeds "
+                    + MAX_FRAME_COMPLETE_OFFSET + " bytes: " + offset);
+        }
+        return offset;
+    }
+
     private static ByteBuffer rawCodeBuffer(int length) {
-        // AMD64's 22-byte entry + 24-byte slow path also covers its legacy trailer.
+        // Reject an impossible body before allocating a copy. Each emitter
+        // also checks the actual mark, which includes its prologue and frame.
+        if (MARK_FRAME_COMPLETE != null && MARK_ENTRY_BARRIER_PATCH != null) checkedFrameCompleteOffset(length);
         int extra = ARM_BARRIER != null ? AArch64EntryBarrier.MAX_BYTES : MARK_ENTRY_BARRIER_PATCH != null ? 46 : 0;
         if (length > Integer.MAX_VALUE - extra - 50) throw new IllegalArgumentException("Machine code too large for JVMCI");
         return ByteBuffer.allocate(length + extra).order(ByteOrder.nativeOrder());
@@ -1616,7 +1632,7 @@ public class Linker {
         int i = 0;
         sites[i++] = AMD64_ENTRY_PATCH;
         if (directJump != null) sites[i++] = directJump;
-        if (MARK_FRAME_COMPLETE != null) sites[i++] = new Mark(callOffset, MARK_FRAME_COMPLETE);
+        if (MARK_FRAME_COMPLETE != null) sites[i++] = new Mark(checkedFrameCompleteOffset(callOffset), MARK_FRAME_COMPLETE);
         sites[i] = slowCall;
         return sites;
     }

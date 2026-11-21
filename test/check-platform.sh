@@ -30,6 +30,12 @@ fi
 cp "$root/test/"{platform_abi.c,PlatformAbiTest.java,PlatformSelectionTest.java} "$work/"
 cd "$work"
 "$compiler" -std=c11 -O2 "${shared[@]}" platform_abi.c -o "$library"
+lookup_name=platform_abi
+if [[ $library == lib* ]]; then
+    # A backslash is an ordinary character in a POSIX library name.
+    lookup_name='\platform_abi'
+    ln -s "$library" "lib$lookup_name.${library##*.}"
+fi
 javac -cp nalim.jar -d . PlatformAbiTest.java PlatformSelectionTest.java
 
 vm=()
@@ -41,7 +47,7 @@ fi
 java "${vm[@]}" -cp "$classpath" one.nalim.PlatformSelectionTest
 vm+=(-Xmx128m -Xbatch -XX:-TieredCompilation -XX:CompileThreshold=1000
      -XX:CompileCommand=dontinline,PlatformAbiTest::machineCall -Djava.library.path=. -cp "$classpath")
-java -XX:+UseG1GC "${vm[@]}" PlatformAbiTest
+java -XX:+UseG1GC "${vm[@]}" PlatformAbiTest "$lookup_name"
 case $(uname -m) in
     x86_64|amd64)
         # Force the indirect narrow bridge, independently of inlining and DLL placement.
