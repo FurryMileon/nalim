@@ -170,21 +170,38 @@ public class Linker {
         return leaf == null ? Optional.empty() : Optional.of(leaf.handle());
     }
 
+    private static final int SMALL_ADAPTER_CAPACITY = 128;
+
     public static void linkClass(Class<?> c) {
         Library library = c.getAnnotation(Library.class);
         if (library != null) {
             loadLibrary(library.value());
         }
 
+        Method[] methods = c.getDeclaredMethods();
+        boolean reuseAdapters = false;
+        if (SYSV_AMD64) {
+            int nativeMethods = 0;
+            for (Method m : methods) {
+                if (Modifier.isNative(m.getModifiers()) && ++nativeMethods == 2) {
+                    reuseAdapters = true;
+                    break;
+                }
+            }
+        }
         InlineScratch scratch = null;
-        for (Method m : c.getDeclaredMethods()) {
+        ByteBuffer reusable = null;
+        for (Method m : methods) {
             Code code = m.getAnnotation(Code.class);
             if (code != null) {
                 installHexCode(m, code.value());
             } else {
                 Link link = m.getAnnotation(Link.class);
                 if (link != null) {
-                    scratch = linkNative(m, link.name(), link.naked(), scratch);
+                    if (reuseAdapters && reusable == null) {
+                        reusable = ByteBuffer.allocate(SMALL_ADAPTER_CAPACITY).order(ByteOrder.nativeOrder());
+                    }
+                    scratch = linkNative(m, link.name(), link.naked(), scratch, reusable);
                 }
             }
         }
@@ -206,12 +223,13 @@ public class Linker {
     }
 
     public static void linkMethod(Method m, String symbol, boolean naked) {
-        linkNative(m, symbol, naked, null);
+        linkNative(m, symbol, naked, null, null);
     }
 
     // Return the workspace for the next method in this class. A framed or
     // no-inline binding never allocates one just to pass it on.
-    private static InlineScratch linkNative(Method m, String symbol, boolean naked, InlineScratch scratch) {
+    private static InlineScratch linkNative(Method m, String symbol, boolean naked, InlineScratch scratch,
+                                            ByteBuffer reusable) {
         checkMethodType(m);
 
         Library library = m.getAnnotation(Library.class);
@@ -235,8 +253,10 @@ public class Linker {
         // 128 bytes covers the entry barrier, six disp32 LEAs and the largest
         // frameless fallback. Reserve Win64 stack marshalling separately: up to
         // 8 bytes to load a spill, 7 for a field LEA, 8 for the outgoing store.
-        int capacity = framed ? 160 + 24 * Math.max(0, types.length - 4) : 128;
-        ByteBuffer buf = ByteBuffer.allocate(capacity).order(ByteOrder.nativeOrder());
+        ByteBuffer buf = reusable == null
+                ? ByteBuffer.allocate(framed ? 160 + 24 * Math.max(0, types.length - 4) : SMALL_ADAPTER_CAPACITY)
+                            .order(ByteOrder.nativeOrder())
+                : reusable.clear();
         emitEntryBarrierPrologue(buf);
         int shuffleStart = buf.position();
 
@@ -273,7 +293,7 @@ public class Linker {
                 ByteBuffer inline = tryInlineSmallFunction(buf, address, symbol, returnType, scratch,
                         !naked && SYSV_AMD64 ? shuffleStart : -1, types, pendingScalarShuffle);
                 if (inline != null) {
-                    installCode(m, inline, null, scratch.rebases);
+                    installCode(m, inline, null, scratch.rebases, inline == reusable);
                     return scratch;
                 }
             }
@@ -290,7 +310,7 @@ public class Linker {
             }
         }
 
-        installCode(m, buf, directJump, null);
+        installCode(m, buf, directJump, null, buf == reusable);
         return scratch;
     }
 
@@ -1502,7 +1522,7 @@ public class Linker {
         ByteBuffer buf = rawCodeBuffer(HexCode.decodedLength(hex));
         emitEntryBarrierPrologue(buf);
         HexCode.emit(buf, hex);
-        installCode(m, buf, null, null);
+        installCode(m, buf, null, null, false);
     }
 
     private static ByteBuffer rawCodeBuffer(int length) {
@@ -1523,7 +1543,7 @@ public class Linker {
         ByteBuffer buf = rawCodeBuffer(length);
         emitEntryBarrierPrologue(buf);
         buf.put(code, 0, length);
-        installCode(m, buf, null, null);
+        installCode(m, buf, null, null, false);
     }
 
     // All executable AMD64 entry barriers have the same prefix. Only the
@@ -1616,7 +1636,7 @@ public class Linker {
     private static final DataPatch[] NO_PATCHES = new DataPatch[0];
     private static final byte[] NO_DATA = new byte[0];
 
-    private static void installCode(Method m, ByteBuffer buf, Call directJump, Fixups rebases) {
+    private static void installCode(Method m, ByteBuffer buf, Call directJump, Fixups rebases, boolean sharedBuffer) {
         Site[] sites;
         int totalFrameSize = 0;
         if (EXECUTABLE_AMD64_BARRIER) {
@@ -1651,10 +1671,15 @@ public class Linker {
         HotSpotResolvedJavaMethod rm = (HotSpotResolvedJavaMethod) jvmci.getMetaAccess().lookupJavaMethod(m);
         int compileId = rm.allocateCompileId(JVMCICompiler.INVOCATION_ENTRY_BCI);
 
+        // JVMCI can publish CompiledCode to listeners. Detach the exact emitted
+        // bytes before reusing a class-local emitter for the next method.
+        int codeSize = buf.position();
+        byte[] code = sharedBuffer ? Arrays.copyOf(buf.array(), codeSize) : buf.array();
+
         HotSpotCompiledNmethod nm = new HotSpotCompiledNmethod(
                 m.getName(),
-                buf.array(),
-                buf.position(),
+                code,
+                codeSize,
                 sites,
                 NO_ASSUMPTIONS,
                 new ResolvedJavaMethod[] { rm },
